@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.bak*
+*.log
+
+# A deployment zip is built by hand and never committed.
+*.zip
+
+.config
+.pytest_cache/
+build/
