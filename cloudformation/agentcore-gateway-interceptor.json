@@ -1,0 +1,356 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "Reva authorization interceptor for an Amazon Bedrock AgentCore Gateway: the interceptor Lambda function, its DynamoDB trace-history table (reva_trace_hop), the RTG token secret (reva/secrets, created with the placeholder value abc: edit it to the real token) and its IAM role. Attach the function to your gateway as a REQUEST interceptor (see the stack outputs).",
+  "Metadata": {
+    "AWS::CloudFormation::Interface": {
+      "ParameterGroups": [
+        {
+          "Label": { "default": "Interceptor code (a zip in S3, in this region)" },
+          "Parameters": ["CodeS3Bucket", "CodeS3Key"]
+        },
+        {
+          "Label": { "default": "Resources this stack creates (change a name only if it clashes)" },
+          "Parameters": ["HistoryTableName", "TokenSecretName", "TokenSecretKey"]
+        },
+        {
+          "Label": { "default": "Reva RTG" },
+          "Parameters": ["RtgBaseUrl", "RtgAuthMode", "PromptKey"]
+        },
+        {
+          "Label": { "default": "Identity and policy mapping" },
+          "Parameters": ["UserClaim", "AuthorizeAgent", "TargetsJson", "ContextMapJson"]
+        },
+        {
+          "Label": { "default": "Behaviour" },
+          "Parameters": ["FailOpen", "MonitorMode", "DebugLogging"]
+        },
+        {
+          "Label": { "default": "Function" },
+          "Parameters": ["FunctionTimeout", "FunctionMemorySize", "LogRetentionDays"]
+        },
+        {
+          "Label": { "default": "Gateway (optional)" },
+          "Parameters": ["GatewayServiceRoleName"]
+        }
+      ],
+      "ParameterLabels": {
+        "CodeS3Bucket": { "default": "S3 bucket holding the interceptor zip" },
+        "CodeS3Key": { "default": "S3 key of the interceptor zip" },
+        "HistoryTableName": { "default": "Name of the DynamoDB history table" },
+        "TokenSecretName": { "default": "Name of the Secrets Manager secret for the RTG token" },
+        "TokenSecretKey": { "default": "Field of the secret that holds the token" },
+        "RtgBaseUrl": { "default": "RTG base URL" },
+        "RtgAuthMode": { "default": "How the RTG token is sent" },
+        "PromptKey": { "default": "Prompt field name in the RTG request" },
+        "UserClaim": { "default": "JWT claim that identifies the user" },
+        "AuthorizeAgent": { "default": "Use the calling agent as the subject" },
+        "TargetsJson": { "default": "Target aliases (REVA_TARGETS)" },
+        "ContextMapJson": { "default": "Argument to Cedar attribute map (REVA_CONTEXT_MAP)" },
+        "FailOpen": { "default": "Let calls through when the RTG is unreachable" },
+        "MonitorMode": { "default": "Monitor only: log denials but allow" },
+        "DebugLogging": { "default": "Debug logging (logs prompts)" },
+        "FunctionTimeout": { "default": "Function timeout (seconds)" },
+        "FunctionMemorySize": { "default": "Function memory (MB)" },
+        "LogRetentionDays": { "default": "Log retention (days)" },
+        "GatewayServiceRoleName": { "default": "Name of the gateway's service role" }
+      }
+    }
+  },
+  "Parameters": {
+    "CodeS3Bucket": {
+      "Type": "String",
+      "Description": "S3 bucket, in the same region as this stack, that holds the interceptor zip (handler.py and the interceptor/ folder at the top of the zip). Build it with: zip -r interceptor.zip handler.py interceptor -x \"*__pycache__*\"",
+      "MinLength": 3
+    },
+    "CodeS3Key": {
+      "Type": "String",
+      "Description": "S3 key of the interceptor zip. Use a new key for each version you deploy: CloudFormation only updates the function when the key changes.",
+      "Default": "interceptor.zip",
+      "MinLength": 1
+    },
+    "HistoryTableName": {
+      "Type": "String",
+      "Description": "Name of the DynamoDB table this stack creates for the per-trace hop history. A table with this name must not already exist in this region; change it if one does, or if you deploy the stack twice in the same region.",
+      "Default": "reva_trace_hop",
+      "AllowedPattern": "^[a-zA-Z0-9_.-]{3,255}$",
+      "ConstraintDescription": "3 to 255 characters: letters, numbers, underscore, hyphen and dot"
+    },
+    "TokenSecretName": {
+      "Type": "String",
+      "Description": "Name of the Secrets Manager secret this stack creates for the Reva RTG token. It is created with the placeholder value abc: edit the value after the stack is created (see the TokenSecretArn output). A secret with this name must not already exist in this region.",
+      "Default": "reva/secrets",
+      "AllowedPattern": "^[a-zA-Z0-9/_+=.@-]{1,512}$",
+      "ConstraintDescription": "1 to 512 characters: letters, numbers and / _ + = . @ -"
+    },
+    "TokenSecretKey": {
+      "Type": "String",
+      "Description": "The field of the secret's JSON that holds the token. The secret is created as {\"RTG_TOKEN\": \"abc\"}; keep this field name when you edit the value.",
+      "Default": "RTG_TOKEN",
+      "MinLength": 1
+    },
+    "RtgBaseUrl": {
+      "Type": "String",
+      "Description": "Base URL of the Reva RTG. The evaluation path is added by the function.",
+      "Default": "https://api.reva.ai",
+      "AllowedPattern": "^https?://.+",
+      "ConstraintDescription": "Must start with https:// (or http:// for local testing)"
+    },
+    "RtgAuthMode": {
+      "Type": "String",
+      "Description": "api-token sends the token as X-API-Token; bearer sends it as Authorization: Bearer.",
+      "Default": "api-token",
+      "AllowedValues": ["api-token", "bearer"]
+    },
+    "PromptKey": {
+      "Type": "String",
+      "Description": "Name of the prompt field in the RTG request (older policy stores use content).",
+      "Default": "userQuery",
+      "MinLength": 1
+    },
+    "UserClaim": {
+      "Type": "String",
+      "Description": "JWT claim that identifies the user (the principal).",
+      "Default": "sub",
+      "MinLength": 1
+    },
+    "AuthorizeAgent": {
+      "Type": "String",
+      "Description": "true: an agent that identifies itself (token claim act.sub or the X-Reva-Agent-Id header) is the subject; false: the user is the subject on every hop.",
+      "Default": "true",
+      "AllowedValues": ["true", "false"]
+    },
+    "TargetsJson": {
+      "Type": "String",
+      "Description": "JSON object that renames or excludes gateway targets, for example {\"my-tools\": {\"id\": \"my-mcp\"}}. {} for none.",
+      "Default": "{}"
+    },
+    "ContextMapJson": {
+      "Type": "String",
+      "Description": "JSON object that maps a call's argument names to the Cedar context attributes your policies read, for example {\"countries\": \"Acme_req_countries\"}. {} for none.",
+      "Default": "{}"
+    },
+    "FailOpen": {
+      "Type": "String",
+      "Description": "true lets calls through when the RTG or the history table is unreachable. false (recommended) denies them. Policy denials are never let through.",
+      "Default": "false",
+      "AllowedValues": ["true", "false"]
+    },
+    "MonitorMode": {
+      "Type": "String",
+      "Description": "true logs what the RTG would deny but lets the call through. Useful for a first run; nothing is blocked while it is true.",
+      "Default": "false",
+      "AllowedValues": ["true", "false"]
+    },
+    "DebugLogging": {
+      "Type": "String",
+      "Description": "true logs the event shape and the RTG request, which contains prompts. Development only.",
+      "Default": "false",
+      "AllowedValues": ["true", "false"]
+    },
+    "FunctionTimeout": {
+      "Type": "Number",
+      "Description": "Function timeout in seconds. Keep it well above the 15 second RTG call timeout.",
+      "Default": 60,
+      "MinValue": 20,
+      "MaxValue": 900
+    },
+    "FunctionMemorySize": {
+      "Type": "Number",
+      "Description": "Function memory in MB.",
+      "Default": 256,
+      "MinValue": 128,
+      "MaxValue": 3008
+    },
+    "LogRetentionDays": {
+      "Type": "Number",
+      "Description": "Days to keep the function's CloudWatch logs.",
+      "Default": 30,
+      "AllowedValues": [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    },
+    "GatewayServiceRoleName": {
+      "Type": "String",
+      "Description": "Optional. Name (not ARN) of your gateway's service role. When set, this stack adds the lambda:InvokeFunction permission on the interceptor to that role. Leave empty to add the permission yourself.",
+      "Default": ""
+    }
+  },
+  "Conditions": {
+    "HasGatewayServiceRole": {
+      "Fn::Not": [{ "Fn::Equals": [{ "Ref": "GatewayServiceRoleName" }, ""] }]
+    }
+  },
+  "Resources": {
+    "HistoryTable": {
+      "Type": "AWS::DynamoDB::Table",
+      "DeletionPolicy": "Delete",
+      "UpdateReplacePolicy": "Delete",
+      "Properties": {
+        "TableName": { "Ref": "HistoryTableName" },
+        "BillingMode": "PAY_PER_REQUEST",
+        "AttributeDefinitions": [
+          { "AttributeName": "pk", "AttributeType": "S" },
+          { "AttributeName": "sk", "AttributeType": "S" }
+        ],
+        "KeySchema": [
+          { "AttributeName": "pk", "KeyType": "HASH" },
+          { "AttributeName": "sk", "KeyType": "RANGE" }
+        ],
+        "TimeToLiveSpecification": {
+          "AttributeName": "expires_at",
+          "Enabled": true
+        }
+      }
+    },
+    "TokenSecret": {
+      "Type": "AWS::SecretsManager::Secret",
+      "Properties": {
+        "Name": { "Ref": "TokenSecretName" },
+        "Description": "Reva RTG token for the AgentCore Gateway interceptor. Created with the placeholder value abc: edit the value to the real token (Secrets Manager, Retrieve secret value, Edit).",
+        "SecretString": { "Fn::Sub": "{\"${TokenSecretKey}\": \"abc\"}" }
+      }
+    },
+    "InterceptorLogGroup": {
+      "Type": "AWS::Logs::LogGroup",
+      "Properties": {
+        "RetentionInDays": { "Ref": "LogRetentionDays" }
+      }
+    },
+    "InterceptorExecutionRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "Description": "Execution role of the Reva AgentCore Gateway interceptor: logs, the trace-history table and the RTG token secret.",
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": { "Service": "lambda.amazonaws.com" },
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          { "Fn::Sub": "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" }
+        ],
+        "Policies": [
+          {
+            "PolicyName": "InterceptorAccess",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "HistoryTable",
+                  "Effect": "Allow",
+                  "Action": [
+                    "dynamodb:Query",
+                    "dynamodb:GetItem",
+                    "dynamodb:PutItem",
+                    "dynamodb:UpdateItem"
+                  ],
+                  "Resource": { "Fn::GetAtt": ["HistoryTable", "Arn"] }
+                },
+                {
+                  "Sid": "RtgToken",
+                  "Effect": "Allow",
+                  "Action": "secretsmanager:GetSecretValue",
+                  "Resource": { "Ref": "TokenSecret" }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    "InterceptorFunction": {
+      "Type": "AWS::Lambda::Function",
+      "Properties": {
+        "Description": "Asks the Reva RTG whether each AgentCore Gateway request is allowed before it is forwarded.",
+        "Runtime": "python3.12",
+        "Handler": "handler.lambda_handler",
+        "Code": {
+          "S3Bucket": { "Ref": "CodeS3Bucket" },
+          "S3Key": { "Ref": "CodeS3Key" }
+        },
+        "Role": { "Fn::GetAtt": ["InterceptorExecutionRole", "Arn"] },
+        "Timeout": { "Ref": "FunctionTimeout" },
+        "MemorySize": { "Ref": "FunctionMemorySize" },
+        "LoggingConfig": {
+          "LogGroup": { "Ref": "InterceptorLogGroup" }
+        },
+        "Environment": {
+          "Variables": {
+            "REVA_BASE_URL": { "Ref": "RtgBaseUrl" },
+            "REVA_AUTH_MODE": { "Ref": "RtgAuthMode" },
+            "REVA_PROMPT_KEY": { "Ref": "PromptKey" },
+            "REVA_TOKEN_SECRET": { "Ref": "TokenSecret" },
+            "REVA_TOKEN_SECRET_KEY": { "Ref": "TokenSecretKey" },
+            "REVA_HISTORY_TABLE": { "Ref": "HistoryTable" },
+            "REVA_USER_CLAIM": { "Ref": "UserClaim" },
+            "REVA_AUTHORIZE_AGENT": { "Ref": "AuthorizeAgent" },
+            "REVA_TARGETS": { "Ref": "TargetsJson" },
+            "REVA_CONTEXT_MAP": { "Ref": "ContextMapJson" },
+            "REVA_FAIL_OPEN": { "Ref": "FailOpen" },
+            "REVA_MONITOR_MODE": { "Ref": "MonitorMode" },
+            "REVA_DEBUG": { "Ref": "DebugLogging" }
+          }
+        }
+      }
+    },
+    "GatewayInvokePolicy": {
+      "Type": "AWS::IAM::Policy",
+      "Condition": "HasGatewayServiceRole",
+      "Properties": {
+        "PolicyName": { "Fn::Sub": "${AWS::StackName}-invoke-interceptor" },
+        "Roles": [{ "Ref": "GatewayServiceRoleName" }],
+        "PolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "InvokeInterceptor",
+              "Effect": "Allow",
+              "Action": "lambda:InvokeFunction",
+              "Resource": { "Fn::GetAtt": ["InterceptorFunction", "Arn"] }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "Outputs": {
+    "InterceptorFunctionArn": {
+      "Description": "ARN of the interceptor function. Attach it to your gateway as a REQUEST interceptor.",
+      "Value": { "Fn::GetAtt": ["InterceptorFunction", "Arn"] }
+    },
+    "InterceptorConfiguration": {
+      "Description": "Save as interceptors.json and pass it to the gateway: aws bedrock-agentcore-control update-gateway --gateway-identifier <id> --interceptor-configurations file://interceptors.json (plus the gateway's other required parameters).",
+      "Value": {
+        "Fn::Sub": "[{\"interceptor\": {\"lambda\": {\"arn\": \"${InterceptorFunction.Arn}\"}}, \"interceptionPoints\": [\"REQUEST\"], \"inputConfiguration\": {\"passRequestHeaders\": true}}]"
+      }
+    },
+    "TableName": {
+      "Description": "DynamoDB table that holds the per-trace hop history.",
+      "Value": { "Ref": "HistoryTable" }
+    },
+    "TokenSecretArn": {
+      "Description": "The secret created for the RTG token. It holds the placeholder value abc: set the real token before use (Secrets Manager, open the secret, Retrieve secret value, Edit; keep the field name RTG_TOKEN). The function picks up a new value within 5 minutes.",
+      "Value": { "Ref": "TokenSecret" }
+    },
+    "ExecutionRoleArn": {
+      "Description": "Execution role of the interceptor function.",
+      "Value": { "Fn::GetAtt": ["InterceptorExecutionRole", "Arn"] }
+    },
+    "LogGroupName": {
+      "Description": "CloudWatch log group of the interceptor function. Each evaluated call logs one decision line.",
+      "Value": { "Ref": "InterceptorLogGroup" }
+    },
+    "GatewayInvokePermission": {
+      "Description": "Whether this stack gave your gateway's service role permission to invoke the interceptor.",
+      "Value": {
+        "Fn::If": [
+          "HasGatewayServiceRole",
+          "Added by this stack",
+          "Not added: allow lambda:InvokeFunction on the interceptor for your gateway's service role, or set GatewayServiceRoleName"
+        ]
+      }
+    }
+  }
+}

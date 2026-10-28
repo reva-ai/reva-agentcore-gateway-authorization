@@ -19,14 +19,15 @@ agent ──► AgentCore Gateway ──► [ this Lambda ] ──► target (MC
 
 1. [How it works](#how-it-works)
 2. [Setup, step by step](#setup-step-by-step)
-3. [What agents must send](#what-agents-must-send)
-4. [Verify it](#verify-it)
-5. [Going live, updating, rolling back](#going-live-updating-rolling-back)
-6. [Reference](#reference): [what it governs](#what-it-governs), [who is calling](#who-is-calling),
+3. [Deploy with CloudFormation](#deploy-with-cloudformation) (instead of most of the setup steps)
+4. [What agents must send](#what-agents-must-send)
+5. [Verify it](#verify-it)
+6. [Going live, updating, rolling back](#going-live-updating-rolling-back)
+7. [Reference](#reference): [what it governs](#what-it-governs), [who is calling](#who-is-calling),
    [history](#history), [failure behaviour](#failure-behaviour), [configuration](#configuration)
-7. [Example: renamed tools and a prefixed policy store](#example-renamed-tools-and-a-prefixed-policy-store)
-8. [Troubleshooting](#troubleshooting)
-9. [Tests](#tests) and [what is not in v1](#not-in-v1)
+8. [Example: renamed tools and a prefixed policy store](#example-renamed-tools-and-a-prefixed-policy-store)
+9. [Troubleshooting](#troubleshooting)
+10. [Tests](#tests) and [what is not in v1](#not-in-v1)
 
 ## How it works
 
@@ -308,6 +309,78 @@ The one that matters most is the same `traceparent` on every call of a prompt.
 ### 10. Check that it works
 
 See [verify it](#verify-it).
+
+## Deploy with CloudFormation
+
+The template [cloudformation/agentcore-gateway-interceptor.json](cloudformation/agentcore-gateway-interceptor.json)
+does setup steps 1 to 5 and 7 in one stack. Attaching the interceptor to the gateway (step 8) and updating the agents
+(step 9) stay manual: CloudFormation cannot change a gateway it did not create.
+
+| The stack creates | Name |
+|---|---|
+| DynamoDB history table | `reva_trace_hop` (parameter `HistoryTableName`) |
+| Secrets Manager secret for the RTG token | `reva/secrets`, holding `{"RTG_TOKEN": "abc"}` (parameter `TokenSecretName`) |
+| Lambda function, its execution role and log group | generated names |
+| Permission for the gateway to invoke the function | only when you set `GatewayServiceRoleName` |
+
+**1. Put the zip in S3.** CloudFormation reads the code from a bucket in the stack's region. Build the zip (step 4) and
+upload it under a new key for each version:
+
+```bash
+zip -r interceptor.zip handler.py interceptor -x "*__pycache__*"
+aws s3 cp interceptor.zip s3://<bucket>/interceptor-1.0.0.zip --region <region>
+```
+
+**2. Deploy the stack.** In the console: CloudFormation → Create stack → upload the template file.
+
+```bash
+aws cloudformation deploy --template-file cloudformation/agentcore-gateway-interceptor.json \
+  --stack-name reva-agentcore-interceptor --capabilities CAPABILITY_IAM --region <region> \
+  --parameter-overrides CodeS3Bucket=<bucket> CodeS3Key=interceptor-1.0.0.zip \
+  GatewayServiceRoleName=<name of your gateway's service role>
+```
+
+Leave out `GatewayServiceRoleName` if you would rather add the invoke permission yourself (step 7).
+
+**3. Set the real token.** The secret is created with the placeholder value `abc`. Replace it: Secrets Manager → `reva/secrets`
+→ Retrieve secret value → Edit, and keep the field name `RTG_TOKEN`. Or from a shell (the token is not echoed or
+stored in the shell history):
+
+```bash
+read -rs RTG_TOKEN && aws secretsmanager put-secret-value --secret-id reva/secrets --region <region> \
+  --secret-string "{\"RTG_TOKEN\": \"$RTG_TOKEN\"}" && unset RTG_TOKEN
+```
+
+The function uses the new value within 5 minutes. Until then the RTG rejects `abc` and calls are denied; keep `FailOpen`
+at its default `false`, because with `true` a rejected token would let calls through unchecked.
+
+**4. Attach the interceptor.** The stack's `InterceptorConfiguration` output is the `interceptors.json` of step 8:
+
+```bash
+aws cloudformation describe-stacks --stack-name reva-agentcore-interceptor --region <region> \
+  --query "Stacks[0].Outputs[?OutputKey=='InterceptorConfiguration'].OutputValue" --output text > interceptors.json
+```
+
+Then run step 8's `update-gateway` with it, update the agents (step 9) and check it works ([verify it](#verify-it)).
+
+Parameters that matter most (the others map to the `REVA_*` settings in the [configuration](#configuration) table and
+all have defaults):
+
+| Parameter | Default | |
+|---|---|---|
+| `CodeS3Bucket`, `CodeS3Key` | required, `interceptor.zip` | where the zip is |
+| `RtgBaseUrl`, `RtgAuthMode` | `https://api.reva.ai`, `api-token` | the RTG and how the token is sent |
+| `TargetsJson`, `ContextMapJson` | `{}`, `{}` | `REVA_TARGETS` and `REVA_CONTEXT_MAP` |
+| `MonitorMode`, `FailOpen`, `DebugLogging` | `false` | the first run's `MonitorMode=true` logs denials without blocking |
+| `GatewayServiceRoleName` | empty | the gateway's service role, to give it permission to invoke the function |
+
+Good to know:
+- The stack fails if a table named `reva_trace_hop` or a secret named `reva/secrets` already exists in the region. Change
+  `HistoryTableName` or `TokenSecretName`, or delete the existing one. Two stacks in one region need different names.
+- To update the code, upload the new zip under a new key and update the stack with that `CodeS3Key`. Editing the secret's
+  value is not undone by a stack update.
+- Deleting the stack deletes the history table, and Secrets Manager keeps a deleted secret for a recovery period, so a
+  stack re-created straight away may need a different `TokenSecretName`.
 
 ## What agents must send
 
@@ -679,7 +752,7 @@ semantics; the first run against a real table does.
 - evaluating inference/LLM traffic (an `invokeModel` hop on a `Model`)
 - a `RESPONSE` interceptor: capturing answers, earlier-prompt `session.messages`, screening tool results
 - `tools/list` filtering
-- deployment templates and an attach script
+- an attach script: the CloudFormation template creates the resources but does not attach the interceptor to an existing gateway
 - an allow-list for agent ids
 
 ## License
