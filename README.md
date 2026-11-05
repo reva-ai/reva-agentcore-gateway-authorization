@@ -47,6 +47,17 @@ nothing to install into the zip.
 
 ## Setup, step by step
 
+**Two ways to set it up. Pick one.**
+
+| | A. CloudFormation (one stack) | B. By hand |
+|---|---|---|
+| What it does | Creates the history table, the token secret, the role and the function in one stack | You create each of them yourself (steps 1 to 7) |
+| What you follow | [Deploy with CloudFormation](#deploy-with-cloudformation), then steps 8 to 10 | Steps 1 to 10 below |
+| Choose it when | you want the quickest start | you want to control each piece, or already have some of them |
+
+Either way you attach the interceptor to the gateway (step 8) and update the agents (step 9) yourself, and you check it
+works (step 10). The code is the same in both: build the zip as in step 4, getting the code first as described there.
+
 Names used below (change them if you like): table `reva_trace_hop`, role `reva-interceptor-role`, function
 `reva-agentcore-interceptor`. Replace `<region>` and `<account-id>` throughout. Create the Lambda in the **same
 region** as the gateway, and the table and the secret in the **Lambda's region** (the function looks for both in its
@@ -171,7 +182,14 @@ full ARN in `REVA_TOKEN_SECRET`, you can put that exact ARN there instead. Witho
 
 ### 4. Build the zip
 
-From the root of this repository:
+**Get the code first.** Clone the repository, or unzip GitHub's "Download ZIP" and open the folder it creates:
+
+```bash
+git clone https://github.com/reva-ai/reva-agentcore-gateway-authorization.git
+cd reva-agentcore-gateway-authorization
+```
+
+Then, from the root of that folder (the one that contains `handler.py`):
 
 ```bash
 zip -r interceptor.zip handler.py interceptor -x "*__pycache__*"
@@ -179,6 +197,11 @@ zip -r interceptor.zip handler.py interceptor -x "*__pycache__*"
 
 `handler.py` must sit at the top of the zip, next to the `interceptor/` folder. Check with `unzip -l interceptor.zip`.
 (`interceptor.zip` is git-ignored.)
+
+**Upload the zip you build with this command, not the zip GitHub gives you.** GitHub's "Download ZIP" wraps everything
+in a folder (`reva-agentcore-gateway-authorization-main/`), so `handler.py` is not at the top of it and Lambda fails with
+`Unable to import module 'handler'`. You can name your zip anything: use the same name wherever the steps say
+`interceptor.zip`.
 
 ### 5. Create the Lambda function and upload the zip
 
@@ -323,8 +346,9 @@ does setup steps 1 to 5 and 7 in one stack. Attaching the interceptor to the gat
 | Lambda function, its execution role and log group | generated names |
 | Permission for the gateway to invoke the function | only when you set `GatewayServiceRoleName` |
 
-**1. Put the zip in S3.** CloudFormation reads the code from a bucket in the stack's region. Build the zip (step 4) and
-upload it under a new key for each version:
+**1. Put the zip in S3.** CloudFormation reads the code from a bucket in the stack's region. Build the zip as in step 4
+(get the code first, and upload the zip you build, not GitHub's own download), then upload it under a new key for each
+version:
 
 ```bash
 zip -r interceptor.zip handler.py interceptor -x "*__pycache__*"
