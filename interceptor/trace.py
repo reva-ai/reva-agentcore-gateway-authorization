@@ -22,6 +22,8 @@ _TRACEPARENT = re.compile(r"^([0-9a-f]{2})-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-
 _XRAY_ROOT = re.compile(r"Root=1-([0-9a-f]{8})-([0-9a-f]{24})", re.IGNORECASE)
 _HEX32 = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 
+# Prefer X-Reva-Session-Id; Thread-Id is legacy / RTG wire.
+SESSION_HEADER = "x-reva-session-id"
 THREAD_HEADER = "x-reva-thread-id"
 MAX_THREAD_CHARS = 256
 
@@ -81,11 +83,13 @@ def traceparent_header(trace_id: str, span: str) -> str:
 def resolve_thread(headers: Mapping[str, str], hint: str, trace_id: str) -> Tuple[str, str]:
     """(thread id, source), for a trace's first call.
 
-    `X-Reva-Thread-Id`, then the A2A `contextId`, then the MCP session id. With none
-    of them the trace is its own thread (the RTG's own fallback): the prompt is
-    judged, but cannot be linked to earlier prompts of the same chat.
+    Prefer `X-Reva-Session-Id`, then legacy `X-Reva-Thread-Id`, then A2A
+    `contextId`, then MCP session id. With none of them the trace is its own
+    thread (the RTG's own fallback): the prompt is judged, but cannot be linked
+    to earlier prompts of the same chat.
     """
-    for source, value in (("header", headers.get(THREAD_HEADER, "")),
+    for source, value in (("header", headers.get(SESSION_HEADER, "")),
+                          ("header", headers.get(THREAD_HEADER, "")),
                           ("contextId", hint),
                           ("mcp-session-id", headers.get("mcp-session-id", ""))):
         value = (value or "").strip()

@@ -11,3 +11,5 @@ __pycache__/
 .config
 .pytest_cache/
 build/
+
+CLOUDFORMATION_SETUP.md

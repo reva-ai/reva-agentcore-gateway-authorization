@@ -4,15 +4,16 @@ A Lambda **interceptor** for an AgentCore Gateway. Before the gateway forwards a
 Reva's RTG whether the call is allowed. The call either goes through, or the Lambda answers on the gateway's behalf
 with a refusal and the tool or agent never runs.
 
-It is the gateway-side counterpart of the Claude Code plugin and the Kong plugin, and it speaks the same RTG
-contract (`POST /pdp/v2/ai/evaluation`; `200` allow, `403` deny).
+It is the gateway-side counterpart of the Claude Code plugin, and it speaks the same RTG contract
+(`POST /pdp/ai/access/ai/evaluation` with `rtg/a2a` body; a `2xx` with `decision: true` is an allow, a `403`
+carrying a verdict is a deny; `X-Reva-Token-Request: transaction` mints a txn token).
 
 ```
 agent ──► AgentCore Gateway ──► [ this Lambda ] ──► target (MCP tool / agent)
-                                    │   ▲
-                       RTG decision │   │ trace record: principal, chat, hops
-                                    ▼   │
-                                   RTG   DynamoDB (reva_trace_hop)
+                                    │
+                       RTG decision │   hop history lives in the RTG (Postgres)
+                                    ▼
+                                   RTG
 ```
 
 **Contents**
@@ -23,7 +24,8 @@ agent ──► AgentCore Gateway ──► [ this Lambda ] ──► target (MC
 4. [What agents must send](#what-agents-must-send)
 5. [Verify it](#verify-it)
 6. [Going live, updating, rolling back](#going-live-updating-rolling-back)
-7. [Reference](#reference): [what it governs](#what-it-governs), [who is calling](#who-is-calling),
+7. [Reference](#reference): [what it governs](#what-it-governs), [context variables](#context-variables),
+   [who is calling](#who-is-calling-token-enrich),
    [history](#history), [failure behaviour](#failure-behaviour), [configuration](#configuration)
 8. [Example: renamed tools and a prefixed policy store](#example-renamed-tools-and-a-prefixed-policy-store)
 9. [Troubleshooting](#troubleshooting)
@@ -34,16 +36,20 @@ agent ──► AgentCore Gateway ──► [ this Lambda ] ──► target (MC
 For every request that reaches the gateway, the Lambda:
 
 1. works out **what is being called** from the shape of the payload (a tool, or an agent) and **who is calling**
-   (the user from the JWT, the agent from a claim or header);
-2. reads the trace's earlier hops from DynamoDB, so the RTG sees the path so far;
-3. asks the RTG;
-4. on an allow, records the hop and lets the request through; on a deny, answers `403` itself.
+   (token enrich: user JWT on `Authorization`, and on nested hops the minted `X-Transaction-Token`);
+2. asks the RTG, sending `traceparent` on every hop, and on the first call of a trace the thread id and `session.id`
+   so the RTG can attach earlier turns (nested hops send the txn token instead; the RTG already has the thread);
+3. on an allow, lets the request through (and injects a minted txn token); on a deny, answers `403` itself.
+4. on the RESPONSE of the UI chat turn, best-effort POSTs `/trace/summarize` so later turns get `session.messages`.
 
-It fails closed: if the RTG or the table is unavailable, or anything is misconfigured, the call is denied (see
+Hop history lives in the RTG. The interceptor sends `traceparent`, and on the first call the thread id and
+`session.id`; it does not send `context.hops` or prior `session.messages`.
+
+It fails closed: if the RTG is unavailable, or anything is misconfigured, the call is denied (see
 [failure behaviour](#failure-behaviour) for the one switch that changes this).
 
-The code is plain Python: the standard library plus `boto3`, which the Lambda runtime already provides. There is
-nothing to install into the zip.
+The code is plain Python: the standard library plus `boto3`, which the Lambda runtime already provides (Secrets
+Manager). There is nothing to install into the zip.
 
 ## Setup, step by step
 
@@ -51,53 +57,27 @@ nothing to install into the zip.
 
 | | A. CloudFormation (one stack) | B. By hand |
 |---|---|---|
-| What it does | Creates the history table, the token secret, the role and the function in one stack | You create each of them yourself (steps 1 to 7) |
-| What you follow | [Deploy with CloudFormation](#deploy-with-cloudformation), then steps 8 to 10 | Steps 1 to 10 below |
+| What it does | Creates the token secret, the role and the function in one stack | You create each of them yourself (steps 1 to 6) |
+| What you follow | [Deploy with CloudFormation](#deploy-with-cloudformation), then steps 7 to 9 | Steps 1 to 9 below |
 | Choose it when | you want the quickest start | you want to control each piece, or already have some of them |
 
-Either way you attach the interceptor to the gateway (step 8) and update the agents (step 9) yourself, and you check it
-works (step 10). The code is the same in both: build the zip as in step 4, getting the code first as described there.
+Either way you attach the interceptor to the gateway (step 7) and update the agents (step 8) yourself, and you check it
+works (step 9). The code is the same in both: build the zip as in step 3, getting the code first as described there.
 
-Names used below (change them if you like): table `reva_trace_hop`, role `reva-interceptor-role`, function
+Names used below (change them if you like): role `reva-interceptor-role`, function
 `reva-agentcore-interceptor`. Replace `<region>` and `<account-id>` throughout. Create the Lambda in the **same
-region** as the gateway, and the table and the secret in the **Lambda's region** (the function looks for both in its
-own).
+region** as the gateway, and the secret in the **Lambda's region**.
 
 You need:
 
-- an AWS account where you may create a DynamoDB table, an IAM role and a Lambda function, and may edit the gateway
-  and its service role;
+- an AWS account where you may create an IAM role and a Lambda function, and may edit the gateway and its service role;
 - an AgentCore Gateway whose authorizer accepts the **user's JWT** (the interceptor reads the user from it);
-- a Reva **RTG token** (it goes into AWS Secrets Manager, step 2) and the RTG base URL if it is not
-  `https://api.reva.ai`, with your agents, tools and policies already set up on the Reva side;
+- a Reva **RTG token** (it goes into AWS Secrets Manager, step 1) and the RTG base URL if it is not
+  `https://api.reva.ai`, with your agents, tools and policies already set up on the Reva side (including RTG
+  trace/history tables for multi-hop context);
 - the AWS CLI v2 if you want to use the commands. Every step also has console instructions.
 
-### 1. Create the DynamoDB table
-
-The table keeps, per trace, who the call is for, which chat it belongs to, and the hops permitted so far. It has a
-string partition key `pk`, a string sort key `sk`, on-demand billing, and a time-to-live on `expires_at` so rows
-clean themselves up. The layout is described under [history](#the-history-table).
-
-**Console:** DynamoDB → Tables → Create table → table name `reva_trace_hop`, partition key `pk` (String), sort key
-`sk` (String) → Table settings: Customize settings → Capacity mode: On-demand → Create table. Then open the table →
-Additional settings → Time to Live (TTL) → Turn on → attribute name `expires_at`.
-
-**CLI:**
-
-```bash
-aws dynamodb create-table --table-name reva_trace_hop --billing-mode PAY_PER_REQUEST \
-  --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
-  --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \
-  --region <region>
-aws dynamodb update-time-to-live --table-name reva_trace_hop \
-  --time-to-live-specification Enabled=true,AttributeName=expires_at --region <region>
-```
-
-A sort key can't be added to an existing table, so a table with a single key can't be reused. The interceptor
-looks for `reva_trace_hop` unless `REVA_HISTORY_TABLE` names another table. Other key names are possible with
-`REVA_HISTORY_PK_ATTR` and `REVA_HISTORY_SK_ATTR`.
-
-### 2. Store the RTG token in Secrets Manager
+### 1. Store the RTG token in Secrets Manager
 
 The token is not kept in the function's configuration. The function reads it from a Secrets Manager secret on the
 first call it evaluates, keeps it for 5 minutes, and reads it again after that, so rotating the token is a change
@@ -116,7 +96,7 @@ rm token.txt
 
 **Recommended: point the function at the secret by its ARN.** Copy the ARN (Secrets Manager → the secret → Secret ARN,
 or `aws secretsmanager describe-secret --secret-id reva/secrets --query ARN --output text`) and set it as
-`REVA_TOKEN_SECRET` in step 6. The function then fetches exactly that secret, whatever it is called and whichever
+`REVA_TOKEN_SECRET` in step 5. The function then fetches exactly that secret, whatever it is called and whichever
 account it is in (see [Several AWS accounts](#several-aws-accounts)). Without the variable it falls back to the name
 `reva/secrets`, so a secret created with that name works with no setting at all.
 
@@ -125,9 +105,9 @@ In a JSON secret the function reads the field `RTG_TOKEN`. To keep the token und
 used and every other field is ignored. A secret encrypted with the default key (`aws/secretsmanager`) needs no extra
 permission; with your own KMS key the role also needs `kms:Decrypt` on it.
 
-### 3. Create the Lambda's execution role
+### 2. Create the Lambda's execution role
 
-The role lets the function write its logs, use the table and read the token secret.
+The role lets the function write its logs and read the token secret.
 
 **Console:** IAM → Roles → Create role → Trusted entity: AWS service → Use case: Lambda → attach the managed policy
 `AWSLambdaBasicExecutionRole` → name it `reva-interceptor-role` → Create role. Then open the role → Add permissions
@@ -152,11 +132,6 @@ The role lets the function write its logs, use the table and read the token secr
   "Statement": [
     {
       "Effect": "Allow",
-      "Action": ["dynamodb:Query", "dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem"],
-      "Resource": "arn:aws:dynamodb:<region>:<account-id>:table/reva_trace_hop"
-    },
-    {
-      "Effect": "Allow",
       "Action": "secretsmanager:GetSecretValue",
       "Resource": "arn:aws:secretsmanager:<region>:<account-id>:secret:reva/secrets-*"
     }
@@ -173,14 +148,11 @@ aws iam put-role-policy --role-name reva-interceptor-role \
   --policy-name reva-interceptor-access --policy-document file://permissions.json
 ```
 
-All four table actions are needed: `Query` reads a trace, `PutItem` writes hop and header rows, `UpdateItem` advances
-a chat's turn, `GetItem` reads a chat. A role that misses one makes the matching step fail, and a failed read or
-header write denies the call (the log says `AccessDeniedException` and names the missing action). Secrets Manager
-adds a random suffix to a secret's ARN (`reva/secrets-AbCdEf`), which is why the policy ends in `-*`; once you set the
-full ARN in `REVA_TOKEN_SECRET`, you can put that exact ARN there instead. Without
+Secrets Manager adds a random suffix to a secret's ARN (`reva/secrets-AbCdEf`), which is why the policy ends in
+`-*`; once you set the full ARN in `REVA_TOKEN_SECRET`, you can put that exact ARN there instead. Without
 `secretsmanager:GetSecretValue` every call is denied with `token_unavailable`.
 
-### 4. Build the zip
+### 3. Build the zip
 
 **Get the code first.** Clone the repository, or unzip GitHub's "Download ZIP" and open the folder it creates:
 
@@ -203,7 +175,7 @@ in a folder (`reva-agentcore-gateway-authorization-main/`), so `handler.py` is n
 `Unable to import module 'handler'`. You can name your zip anything: use the same name wherever the steps say
 `interceptor.zip`.
 
-### 5. Create the Lambda function and upload the zip
+### 4. Create the Lambda function and upload the zip
 
 **Console:** Lambda → Create function → Author from scratch →
 
@@ -232,27 +204,26 @@ aws lambda create-function --function-name reva-agentcore-interceptor \
   --zip-file fileb://interceptor.zip --timeout 60 --memory-size 256 --region <region>
 ```
 
-Do not put the Lambda in a VPC unless the VPC can reach both the RTG (internet or a private link) and DynamoDB
-(a gateway endpoint). A function that cannot reach the RTG denies every call with `rtg_unavailable`.
+Do not put the Lambda in a VPC unless the VPC can reach the RTG (internet or a private link). A function that
+cannot reach the RTG denies every call with `rtg_unavailable`.
 
-### 6. Set the environment variables
+### 5. Set the environment variables
 
 **Console:** Configuration tab → Environment variables → Edit → Add environment variable. Values that are JSON
 (`REVA_TARGETS`, `REVA_CONTEXT_MAP`) go on one line.
 
-One variable is recommended: **`REVA_TOKEN_SECRET`**, set to the secret's full ARN (step 2). No variable is strictly
-required: the host is `https://api.reva.ai`, the table is `reva_trace_hop`, the token is looked up by the name
-`reva/secrets` if the variable is not set, and the RTG is called with `X-API-Token`. Set these as your setup needs:
+One variable is recommended: **`REVA_TOKEN_SECRET`**, set to the secret's full ARN (step 1). No variable is strictly
+required: the host is `https://api.reva.ai`, the token is looked up by the name `reva/secrets` if the variable is not
+set, and the RTG is called with `X-API-Token: Bearer <token>`. Set these as your setup needs:
 
 | Variable | When |
 |---|---|
 | `REVA_TOKEN_SECRET` | **recommended**: the secret's full ARN, for example `arn:aws:secretsmanager:us-west-2:123456789012:secret:reva/secrets-AbCdEf`. Needed when the secret is not named `reva/secrets` or is in another account |
 | `REVA_TOKEN_SECRET_KEY` | the secret is JSON and holds the token under a field other than `RTG_TOKEN` |
 | `REVA_BASE_URL` | the RTG is not at `https://api.reva.ai` |
-| `REVA_AUTH_MODE=bearer` | the RTG expects `Authorization: Bearer` instead of `X-API-Token` |
-| `REVA_HISTORY_TABLE` | your table is not named `reva_trace_hop` |
+| `REVA_AUTH_MODE=bearer` | the RTG expects the gateway credential in `Authorization: Bearer` instead of `X-API-Token: Bearer` |
 | `REVA_TARGETS` | a gateway target's name differs from the tool or agent id in your policy store |
-| `REVA_CONTEXT_MAP` | a policy reads values out of the call's arguments (see [configuration](#configuration)) |
+| `REVA_CONTEXT_MAP` | a policy reads a value from the call under another name than the call's own (see [context variables](#context-variables)) |
 
 For the first run, also set `REVA_MONITOR_MODE=true` (a deny is logged but the call still goes through) and
 `REVA_DEBUG=true` (logs the event's shape and the RTG request; it contains prompts). Remove both before real use.
@@ -263,7 +234,7 @@ function's configuration by accident.
 The full list is in [configuration](#configuration). A bad value never crashes the function: it is reported in the
 log and every call is denied with `config_error` until you fix it.
 
-### 7. Let the gateway invoke the function
+### 6. Let the gateway invoke the function
 
 AWS requires the **gateway's service role** to be allowed to invoke the interceptor, and recommends allowing only
 that function.
@@ -291,18 +262,18 @@ aws iam put-role-policy --role-name <gateway-service-role> \
 whether a resource policy on the Lambda is also needed. For a gateway in the same account the role's policy is
 enough; if the gateway reports that it cannot invoke the function, check this step first.
 
-### 8. Attach the interceptor to the gateway
+### 7. Attach the interceptor to the gateway
 
-The gateway needs one **REQUEST** interceptor with **`passRequestHeaders: true`**. Without that flag the gateway
-does not hand the Lambda any headers, so it never sees the user's token or the `traceparent`, and every first call
-is denied with `missing_authorization`.
+The gateway needs **REQUEST + RESPONSE** with **`passRequestHeaders: true`**. Without that flag the gateway
+does not hand the Lambda any headers, so it never sees the user's token or the `traceparent`, and every call is
+denied with `missing_authorization`. RESPONSE finalizes the turn (`/trace/summarize`) for `session.messages`.
 
 Save this as `interceptors.json`:
 
 ```json
 [{
   "interceptor": {"lambda": {"arn": "arn:aws:lambda:<region>:<account-id>:function:reva-agentcore-interceptor"}},
-  "interceptionPoints": ["REQUEST"],
+  "interceptionPoints": ["REQUEST", "RESPONSE"],
   "inputConfiguration": {"passRequestHeaders": true}
 }]
 ```
@@ -320,33 +291,36 @@ AWS's documentation does not list the required parameters of `update-gateway`. R
 and see `aws bedrock-agentcore-control update-gateway help`. The console's gateway page may also have an
 interceptor section; AWS does not document its wording. The field names above are the documented ones.
 
-A gateway holds at most one REQUEST and one RESPONSE interceptor. This function ignores the response leg (it
-answers the response unchanged), so attach it as REQUEST only; a RESPONSE attachment only adds a Lambda call to
-every response.
+A gateway holds at most one REQUEST and one RESPONSE interceptor. Attach this Lambda as **both**:
+REQUEST evaluates the call; RESPONSE best-effort POSTs `/pdp/ai/access/ai/trace/summarize` at the
+**end of the UI chat turn** (when the session/thread key is present again — not mid-trace nested hops)
+so later turns get `session.messages`. Some HTTP RESPONSE events arrive without a `gatewayRequest`: a Runtime
+agent can then embed `_reva` in its JSON body. A tool's `Mcp-Session-Id` does not mark the entry
+hop, because agents send it on their nested tool calls as well.
 
-### 9. Update the agents
+### 8. Update the agents
 
 Every agent that calls through the gateway has to send a few things. See [what agents must send](#what-agents-must-send).
-The one that matters most is the same `traceparent` on every call of a prompt.
+The ones that matter most are the same `traceparent` on every call of a prompt, the user's JWT, and
+on nested hops the minted `X-Transaction-Token` (token enrich).
 
-### 10. Check that it works
+### 9. Check that it works
 
 See [verify it](#verify-it).
 
 ## Deploy with CloudFormation
 
 The template [cloudformation/agentcore-gateway-interceptor.json](cloudformation/agentcore-gateway-interceptor.json)
-does setup steps 1 to 5 and 7 in one stack. Attaching the interceptor to the gateway (step 8) and updating the agents
-(step 9) stay manual: CloudFormation cannot change a gateway it did not create.
+does setup steps 1 to 4 and 6 in one stack. Attaching the interceptor to the gateway (step 7) and updating the agents
+(step 8) stay manual: CloudFormation cannot change a gateway it did not create.
 
 | The stack creates | Name |
 |---|---|
-| DynamoDB history table | `reva_trace_hop` (parameter `HistoryTableName`) |
 | Secrets Manager secret for the RTG token | `reva/secrets`, holding `{"RTG_TOKEN": "abc"}` (parameter `TokenSecretName`) |
 | Lambda function, its execution role and log group | generated names |
 | Permission for the gateway to invoke the function | only when you set `GatewayServiceRoleName` |
 
-**1. Put the zip in S3.** CloudFormation reads the code from a bucket in the stack's region. Build the zip as in step 4
+**1. Put the zip in S3.** CloudFormation reads the code from a bucket in the stack's region. Build the zip as in step 3
 (get the code first, and upload the zip you build, not GitHub's own download), then upload it under a new key for each
 version:
 
@@ -364,7 +338,7 @@ aws cloudformation deploy --template-file cloudformation/agentcore-gateway-inter
   GatewayServiceRoleName=<name of your gateway's service role>
 ```
 
-Leave out `GatewayServiceRoleName` if you would rather add the invoke permission yourself (step 7).
+Leave out `GatewayServiceRoleName` if you would rather add the invoke permission yourself (step 6).
 
 **3. Set the real token.** The secret is created with the placeholder value `abc`. Replace it: Secrets Manager → `reva/secrets`
 → Retrieve secret value → Edit, and keep the field name `RTG_TOKEN`. Or from a shell (the token is not echoed or
@@ -378,14 +352,14 @@ read -rs RTG_TOKEN && aws secretsmanager put-secret-value --secret-id reva/secre
 The function uses the new value within 5 minutes. Until then the RTG rejects `abc` and calls are denied; keep `FailOpen`
 at its default `false`, because with `true` a rejected token would let calls through unchecked.
 
-**4. Attach the interceptor.** The stack's `InterceptorConfiguration` output is the `interceptors.json` of step 8:
+**4. Attach the interceptor.** The stack's `InterceptorConfiguration` output is the `interceptors.json` of step 7:
 
 ```bash
 aws cloudformation describe-stacks --stack-name reva-agentcore-interceptor --region <region> \
   --query "Stacks[0].Outputs[?OutputKey=='InterceptorConfiguration'].OutputValue" --output text > interceptors.json
 ```
 
-Then run step 8's `update-gateway` with it, update the agents (step 9) and check it works ([verify it](#verify-it)).
+Then run step 7's `update-gateway` with it, update the agents (step 8) and check it works ([verify it](#verify-it)).
 
 Parameters that matter most (the others map to the `REVA_*` settings in the [configuration](#configuration) table and
 all have defaults):
@@ -399,27 +373,25 @@ all have defaults):
 | `GatewayServiceRoleName` | empty | the gateway's service role, to give it permission to invoke the function |
 
 Good to know:
-- The stack fails if a table named `reva_trace_hop` or a secret named `reva/secrets` already exists in the region. Change
-  `HistoryTableName` or `TokenSecretName`, or delete the existing one. Two stacks in one region need different names.
-- To update the code, upload the new zip under a new key and update the stack with that `CodeS3Key`. Editing the secret's
-  value is not undone by a stack update.
-- Deleting the stack deletes the history table, and Secrets Manager keeps a deleted secret for a recovery period, so a
-  stack re-created straight away may need a different `TokenSecretName`.
+- The stack fails if a secret named `reva/secrets` already exists in the region. Change `TokenSecretName`, or delete
+  the existing one. Two stacks in one region need different secret names.
+- To update the code (redeploy): zip → upload under a **new** `CodeS3Key` →
+  `cloudformation deploy` with that key (and your existing parameters). See
+  [CLOUDFORMATION_SETUP.md — Updating the interceptor code later](CLOUDFORMATION_SETUP.md#updating-the-interceptor-code-later-redeploy).
+  Editing the secret's value is not undone by a stack update.
+- Hop history lives in the RTG and is unaffected by deleting the stack. Secrets Manager keeps a deleted secret for a
+  recovery period, so a stack re-created straight away may need a different `TokenSecretName`.
 
 ## What agents must send
 
 | | Required | Why |
 |---|---|---|
-| `Authorization: Bearer <user JWT>` on the **first gateway call of each prompt**, and `passRequestHeaders: true` on the gateway | yes | the principal is read from it once and stored |
-| the same W3C **`traceparent`** on every call of one prompt | yes | it correlates the hops and keys the stored record. An OpenTelemetry-instrumented HTTP client normally propagates it; check yours |
-| a **thread id** on the first call of each prompt: `X-Reva-Thread-Id`, or A2A `contextId`, or `Mcp-Session-Id` | recommended | links prompts of one chat. Without one, each prompt is its own chat (a warning is logged) |
-| `X-Reva-Agent-Id: <the agent's RTG entity id>` on an agent's own outbound calls | only for an `Agent` subject | nothing else in the event says which agent is calling |
-| values a policy needs to see (countries, clients, ...) in the call: **tool arguments** for a tool call, the message's **`metadata`** for an agent call | only where a policy reads them | see `REVA_CONTEXT_MAP` below; the keys must match the map's |
-| hop lists, conversation blocks, session ids, turn numbers | **no** | kept in DynamoDB |
-
-Later hops of a prompt need only the `traceparent` (the gateway still requires whatever token its authorizer
-accepts). If an agent sends no agent id its hops are still evaluated, with the user as subject and
-`subjectSource` set to `user_fallback` in the log.
+| `Authorization: Bearer <user JWT>`, and `passRequestHeaders: true` on the gateway | yes on the UI entry hop; send on nested hops when the runtime forwards it | token enrich: RTG reads the user from the JWT (`REVA_USER_CLAIM`) |
+| the same W3C **`traceparent`** on every call of one prompt | yes | correlates hops so the RTG can attach earlier history. An OpenTelemetry-instrumented HTTP client normally propagates it; check yours |
+| a **session/thread id** on the UI chat turn: `X-Reva-Session-Id` (preferred), or `X-Reva-Thread-Id`, or A2A `contextId`, or `Mcp-Session-Id` | yes for multi-turn chat + summarize | links prompts of one chat. Only `X-Reva-Session-Id` / `X-Reva-Thread-Id` mark the entry RESPONSE for `/trace/summarize`. It is sent to the RTG on the first call only; nested hops (a txn token is present) send none. Without one, each prompt is its own chat |
+| `X-Transaction-Token` from the prior allow on nested hops | yes for nested hops | token enrich: RTG derives Agent subject from the token. Entry allow mints it via `X-Reva-Token-Request: transaction` |
+| values a policy needs to see (countries, clients, ...) in the call: **tool arguments** for a tool call, the **`metadata`** of the request, message or parts for an agent call | only where a policy reads them | sent under their own names ([context variables](#context-variables)); `REVA_CONTEXT_MAP` renames chosen keys to the attributes a policy reads |
+| hop lists, conversation blocks, prior `session.messages`, turn numbers | **no** | kept by the RTG; the interceptor only sends `session.id` |
 
 An A2A call carries its extra values like this:
 
@@ -437,8 +409,9 @@ An A2A call carries its extra values like this:
 }
 ```
 
-`metadata` is a standard, free-form A2A field. Only the keys listed in `REVA_CONTEXT_MAP` are ever sent on to the
-RTG; the rest stays here. Leave out empty values.
+`metadata` is a standard, free-form A2A field. Every key in the request's, the message's and each part's `metadata`
+is sent on to the RTG under its own name, within the [rules for context variables](#context-variables); an empty
+value is left out. The A2A HTTP+JSON binding carries the same fields in `POST /<agent>/message:send`'s body.
 
 ## Verify it
 
@@ -475,30 +448,31 @@ already has):
 ```bash
 python3 - <<'EOF'
 import base64, json
-b = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
-print(f"{b({'alg': 'none'})}.{b({'sub': 'test-user'})}.x")
+# Use a registered alg (e.g. HS256). RTG's go-jwt ParseUnverified rejects alg:none.
+# The signature is not verified (ingress already authenticated the caller).
+b = lambda d: base64.urlsafe_b64encode(json.dumps(d, separators=(",", ":")).encode()).rstrip(b"=").decode()
+print(f"{b({'alg': 'HS256', 'typ': 'JWT'})}.{b({'sub': 'test-user'})}.e30")
 EOF
 ```
 
 - **Allowed:** the response is `{"interceptorOutputVersion": "1.0", "mcp": {"transformedGatewayRequest": {"body": ...}}}`.
 - **Denied:** the response has `transformedGatewayResponse` with `statusCode` `403` and a `data.code` saying why.
 
-A test event is a real call: it goes to the RTG and, if allowed, writes a row to the table.
+A test event is a real call: it goes to the RTG. The interceptor does not write a local hop row; the RTG records the
+hop in its own store.
 
 ### End to end
 
 1. Ask your agent a question that crosses the gateway.
 2. **CloudWatch Logs** → log group `/aws/lambda/reva-agentcore-interceptor`. Each evaluated call logs one line like
    `{"event":"decision","decision":"permit","outcome":"allow","trace":"...","traceSource":"traceparent","thread":"...",
-   "action":"invokeTool","resource":"my-target/my_tool","subjectType":"Agent","subjectSource":"header:x-reva-agent-id",
-   "turn":1,"firstCall":true,"hopsSent":0,...}`. `decision` is `permit`, `deny`, or one of `permit_conditional`,
-   `monitor_would_deny` (monitor mode: the RTG said no, the call went through) and `permit_fail_open` (the RTG could
-   not be asked and `REVA_FAIL_OPEN=true`). Check that `trace` is the same for every hop of the prompt, `subjectType`
-   is what you expect, and `traceSource` says `traceparent`.
-3. **DynamoDB** → `reva_trace_hop` → Explore table items. After a prompt you should see a `TR#<trace>` / `#META`
-   row, one `TR#<trace>` / `HOP#<span>` row per permitted hop, and a `TH#<thread>` / `#META` row.
-4. In the **RTG's decision log**, the later hops should arrive with the earlier ones in `context.hops` and the
-   same thread id.
+   "action":"invokeTool","resource":"my-target/my_tool","subjectType":"derived","subjectSource":"transaction_token",
+   ...}`. `decision` is `permit`, `deny`, or one of `permit_conditional`, `monitor_would_deny` (monitor mode: the RTG
+   said no, the call went through) and `permit_fail_open` (the RTG could not be asked and `REVA_FAIL_OPEN=true`).
+   Check that `trace` is the same for every hop of the prompt, `subjectType` is what you expect, and `traceSource`
+   says `traceparent`.
+4. In the **RTG's decision log**, hops of one prompt share a `traceparent` / thread id; the RTG attaches earlier
+   hops from its store for that trace.
 
 If something is off, see [troubleshooting](#troubleshooting).
 
@@ -519,12 +493,12 @@ read keeps being used and a `token_refresh_failed` warning is logged.
 **Updating the code**
 
 1. Lambda → Code → Actions → Download .zip: keep the version that works now.
-2. Rebuild the zip (step 4) and upload it (Code → Upload from → .zip file). The handler and the environment
-   variables stay as they are.
+2. Rebuild the zip (step 3) and upload it (Code → Upload from → .zip file). The handler and the environment
+variables stay as they are.
 3. Run a test event.
 
 **Rolling back:** upload the zip you downloaded. To take the interceptor out of the path altogether, remove it from
-the gateway's interceptor configuration (step 8).
+the gateway's interceptor configuration (step 7).
 
 ## Reference
 
@@ -536,70 +510,87 @@ about that. Entity types come from the protocol; ids come from the payload.
 | Payload | action | resource | prompt sent to the RTG |
 |---|---|---|---|
 | MCP `tools/call`, `params.name = <target>___<tool>` | `invokeTool` | `Tool` `<target>/<tool>` | the arguments as JSON |
-| A2A `message/send` to `/<target>/invocations` | `invokeAgent` | `Agent` `<target>` | the message's text parts |
-| plain AgentCore Runtime call to `/<target>/invocations` | `invokeAgent` | `Agent` `<target>` | `prompt`/`input`/`message`/`query`/`text`, else the body |
+| A2A `message/send` (JSON-RPC) to `/<target>/invocations` | `invokeAgent` | `Agent` `<target>` | the message's text parts, and its data parts as JSON |
+| A2A HTTP+JSON binding: `POST /<target>/message:send` or `/message:stream` | `invokeAgent` | `Agent` `<target>` | the same |
+| plain AgentCore Runtime call to `/<target>/invocations` | `invokeAgent` | `Agent` `<target>` | `prompt` / nested `input.prompt` / …, else the body |
+| Gateway inference / OpenAI-compatible `chat/completions` (`model` + `messages`) | `invokeModel` | `Model` `<model>` | last user message |
 | MCP `initialize`, `tools/list`, `ping`, notifications, GET/DELETE | not evaluated | | |
-| anything else on an HTTP target (including inference/LLM traffic) | not evaluated by default (`REVA_UNCLASSIFIED=deny` refuses it) | | |
+| anything else on an HTTP target | not evaluated by default (`REVA_UNCLASSIFIED=deny` refuses it) | | |
 
-LLM calls only reach a gateway if an agent's model client is pointed at the gateway's `/inference` endpoint; an
-agent that calls Bedrock, LiteLLM or OpenAI directly never touches it. Evaluating that traffic is not part of v1.
+LLM hops only appear when the agent's model client uses the gateway (e.g. `AGENTCORE_LLM_URL`). Direct
+OpenAI/Bedrock calls never reach this Lambda.
 
 `REVA_TARGETS` can rename a target's entity id (`{"acme-tools": {"id": "acme-mcp"}}`) or exclude a target
 (`{"public": {"kind": "skip"}}`). It is the only topology configuration.
 
-### Who is calling
+### Context variables
+
+Besides the prompt, the interceptor sends name/value pairs from the request body to the RTG as `context`, so a
+policy can match on them, for example *refuse this tool when `priority` is `high`*. The rules are the Kong plugin's
+(2.1.0). Which fields are read depends on the call:
+
+| Call | Read from | Sent under |
+|---|---|---|
+| MCP `tools/call` | everything in `params` except the tool name: `arguments` and `_meta` | the field's own name, so `_meta.progressToken` is sent as `progressToken` |
+| A2A (JSON-RPC and HTTP+JSON) | every `metadata` object: the request's, the message's and each message part's | the metadata's own names |
+| Model (OpenAI chat) | `metadata`, and the settings at the top of the body, such as `max_tokens`, `stream` and `user` | the field's own name |
+
+`model`, `messages` and `tools` are not context: the model is the resource and the messages are the prompt.
+Everything in the fields above goes to the RTG (a tool's arguments already travel in the prompt), so keep out of
+them anything you do not want evaluated, or set `REVA_CONTEXT_FROM_BODY=false`.
+
+- A nested object becomes dotted names: `{"customer": {"tier": "gold"}}` is sent as `customer.tier`.
+- When a name appears more than once, the more specific one wins: a part's metadata over the message's over the
+  request's; MCP `arguments` over `_meta`; for a model call, a top-level setting over `metadata`.
+- Only these values are sent: text, `true` or `false`, whole numbers, and lists of one of those. Null, decimals (so
+  `temperature: 0.2`), objects inside lists, empty values and lists that mix types are left out.
+- Names the RTG uses itself (`action`, `subject`, `resource`, `history` and a few others), names that look like
+  credentials (`password`, `apiKey`, `authorization`, `cookie`), and values that look like a bearer token or a JWT
+  are left out.
+- A call carries at most 64 pairs and 512 bytes of JSON in all. When there is more, the pairs that fit are sent,
+  taken in alphabetical order of name, and the rest are left out.
+- Context is sent on every call, first or later hop, and describes that call.
+- `REVA_CONTEXT_MAP` copies chosen keys to the attribute names a policy reads (`countries` becomes
+  `Acme_req_countries`). Mapped pairs follow the same rules, replace a body pair of the same name, and
+  are first in line for the 64 pairs and 512 bytes.
+- The RTG refuses a whole request when one pair is outside what it reads. The pairs are filtered first; if the RTG
+  still answers `400` to a request carrying context, the call is evaluated once more without it.
+- With `REVA_DEBUG=true` the log lists, by name and reason and never by value, the pairs that were left out
+  (`debug_context_left_out`).
+
+### Who is calling (token enrich)
 
 | | Where it comes from |
 |---|---|
-| **principal** (`User`) | the bearer JWT's `REVA_USER_CLAIM` (default `sub`). Decoded **once**, on the first call of a trace, and stored. Later hops read it from DynamoDB. |
-| **subject** | with `REVA_AUTHORIZE_AGENT=true` (default): `Agent(id)` if an agent id resolves, otherwise the user. With `false`: the user on every hop. |
-| **agent id** | JWT claim `act.sub` (RFC 8693 token exchange), then the header `X-Reva-Agent-Id`. `REVA_AGENT_CLAIMS` adds claims, `REVA_AGENT_HEADER` renames the header, `REVA_AGENT_ID_MAP` maps values to RTG entity ids. |
-| **groups** | optional: the claim in `REVA_GROUPS_CLAIM` becomes `UserGroup` parents of the user. |
+| **principal** (`User`) | the bearer JWT's `REVA_USER_CLAIM` (default `sub`), when `Authorization` is present. |
+| **subject (UI entry hop)** | `User` from the JWT (body includes `subject` / `principal`), `transmission.role` is `user`. |
+| **subject (nested hop)** | derived by the RTG from `X-Transaction-Token` (body omits subject/principal and the thread id; `transmission.role` is the call's own, `agent` by default). Send the user JWT as well when the runtime forwards it (`Authorization` + txn). |
+| **groups** | optional: the claim in `REVA_GROUPS_CLAIM` becomes `UserGroup` parents of the user (entry hop only). |
 
-The gateway has already validated the JWT, so it is decoded without re-verifying. Nothing in the gateway event
-identifies the calling agent, which is why the agent id has to come from the token or a header. `client_id` and
-`azp` are not used by default: when an agent forwards the user's token they name the UI app on every hop.
-**The header is a caller assertion and can be forged.**
+The gateway has already validated the JWT, so it is decoded without re-verifying. Nested Agent identity
+comes from the minted transaction token, not from `X-Reva-Agent-Id`. Absence of a txn token is **not**
+how entry vs nested is decided for summarize — that uses the explicit `X-Reva-Session-Id` / `X-Reva-Thread-Id` on the call.
 
 ### History
 
-Per trace, in DynamoDB (`REVA_HISTORY=interceptor`, the default): who the trace is for, which chat it belongs to,
-the turn number, and the hops permitted so far. Each call asks the RTG about itself with `context.hops` and
-`context.conversation.messages` (paired, same `seq`) describing the hops before it, and `session`
-`{id, turn, startedAt}`. A hop is recorded only after it is permitted, once per call (a gateway retry does not
-duplicate it), and the call under evaluation is never part of its own history. A call costs one `Query`, the RTG
-call and one `PutItem`; a trace's first call adds a few writes.
-
-`REVA_HISTORY=rtg` is for an RTG that keeps thread history itself: only `traceparent` and the thread id are
-sent, nothing is stored, and the JWT is decoded on every hop.
-
-#### The history table
-
-The layout mirrors the RTG's own `trace_hop` table: one row per hop, plus a header row per trace.
-
-| Partition key | Sort key | Holds |
-|---|---|---|
-| `TR#<trace id>` | `#META` | the trace's header: `principal`, `groups`, `thread_id`, `turn`, `started_at` |
-| `TR#<trace id>` | `HOP#<span id>` | one permitted hop: `received_at`, `subject`, `action`, `resource`, `role`, `content` |
-| `TH#<thread id>` | `#META` | the chat: `traces` (trace ids in arrival order), `started_at` |
-
-Every row carries `expires_at`. Traces live 1 h from their first call, threads 24 h.
-
-- A hop row is written only if absent, so a gateway retry of the same call is recorded once. Parallel tool calls
-  each write their own row, so none is lost.
-- The header row is written before the RTG is asked, only if absent, so the first writer wins a race.
-- One consistent `Query` reads the header and the hops together, at most 200 rows.
+The RTG keeps thread/hop history (Postgres `trace_hop` / tracesummary). The interceptor sends `traceparent` and,
+on the first call of a trace, the thread id and `session.id` (same value); a nested hop sends the txn token and
+no thread. It does not send `context.hops` or prior `session.messages`. On the
+RESPONSE of the UI chat turn it POSTs `/trace/summarize` with the final answer, read from the response body: an
+OpenAI chat completion, an MCP tool result, an A2A Message or Task (JSON-RPC or HTTP+JSON), or a Runtime agent's
+`message` / `reply` / `text` / `content` / `output`. A body that is not JSON, or in no known shape, is sent as it
+is, up to 16 KB.
 
 ### Failure behaviour
 
 | Situation | Result |
 |---|---|
-| RTG `403`, or a `decision: false` body, or `401 USER_NOT_FOUND`/`USER_DISABLED` | **deny** (`REVA_MONITOR_MODE=true` logs it and passes) |
-| any other RTG `4xx` (the request is invalid) | **deny**, never fails open |
-| RTG `401`/`404`/`408`/`413`/`424`/`425`/`429`/`5xx`, timeout, unreachable, or the history table unreadable | **deny**; **pass** if `REVA_FAIL_OPEN=true` (and the hop is not recorded). Transient faults are retried once inside the time the Lambda has left |
+| RTG `403` with a verdict (a `decision` or `error_type` in the body), a `2xx` with `decision: false`, a `2xx` with no `decision: true`, or `401 USER_NOT_FOUND`/`USER_DISABLED` | **deny** (`REVA_MONITOR_MODE=true` logs it and passes) |
+| any other RTG `4xx` (the request is invalid) | **deny**, never fails open. A `400` on a request that carried context is first evaluated again without it |
+| RTG `401`/`404`/`408`/`413`/`424`/`425`/`429`/`5xx`, a `403` with no verdict (an edge or proxy refusing, not the RTG), timeout, unreachable | **deny**; **pass** if `REVA_FAIL_OPEN=true`. Transient faults are retried once inside the time the Lambda has left |
 | RTG `200` with `guardrails.outcome = conditional_allow` | **deny** (the gateway has no "ask"); `REVA_CONDITIONAL_ALLOW=allow` passes |
 | the RTG token cannot be read from Secrets Manager (and none was read before) | **deny** with `token_unavailable`, never fails open: without the credential the RTG cannot be asked |
-| no user token on a trace's first call, no principal claim, a malformed MCP body, a JSON-RPC batch containing `tools/call`, bad configuration, any internal error | **deny**, never fails open |
+| no user token, no principal claim, a malformed MCP body, a JSON-RPC batch containing `tools/call`, bad configuration, any internal error | **deny**, never fails open |
 
 A deny is HTTP `403` (`REVA_DENY_STATUS`). MCP and A2A calls get a JSON-RPC error whose `data.code` says why; a plain
 Runtime call gets `{"error": {"type": "permission_denied", "code": ..., "message": ...}}`. The caller sees only
@@ -609,11 +600,10 @@ Runtime call gets `{"error": {"type": "permission_denied", "code": ..., "message
 |---|---|
 | `policy_denied` | the RTG said no (or `conditional_allow` with `REVA_CONDITIONAL_ALLOW=deny`) |
 | `rtg_rejected` | the RTG found the request invalid (a `4xx` other than `401`/`403`/`404`/`408`/`413`/`424`/`425`/`429`) |
-| `rtg_unavailable` | the RTG could not be asked or answered with an outage-type status |
+| `rtg_unavailable` | the RTG could not be asked or answered with an outage-type status (or a `403` with no verdict) |
 | `token_unavailable` | the RTG token could not be read from Secrets Manager |
-| `history_unavailable` | the history table could not be read or its header written |
 | `config_error` | a configuration value is invalid; the log line names it |
-| `missing_authorization`, `invalid_authorization`, `principal_unresolved` | no bearer token, not a JWT, or no user claim on a trace's first call |
+| `missing_authorization`, `invalid_authorization`, `principal_unresolved` | no bearer token, not a JWT, or no user claim |
 | `traceparent_missing` | no trace id and `REVA_ON_MISSING_TRACEPARENT=deny` |
 | `malformed_body`, `batch_unsupported`, `malformed_event` | the request is not something it can judge safely |
 | `unresolvable_resource`, `unclassified_traffic` | no entity id could be worked out, or `REVA_UNCLASSIFIED=deny` |
@@ -625,8 +615,8 @@ to repeat.
 
 ### Several AWS accounts
 
-By default everything the function uses is in **its own account and region**: the secret (found by name) and the
-history table. With several accounts there are two ways to go.
+By default the secret the function uses is in **its own account and region** (found by name). With several accounts
+there are two ways to go.
 
 **One deployment per account (simplest).** Repeat the setup in each account: its own table, its own secret, its own
 Lambda. Nothing is shared.
@@ -667,9 +657,8 @@ cross-account guide:
    ```
 5. Set `REVA_TOKEN_SECRET` on the function to the secret's full ARN.
 
-The history table is always in the function's own account and region (it is addressed by name), so each account keeps
-its own. Keep the interceptor Lambda in the gateway's account too: AWS's pages do not document a gateway invoking a
-function in another account.
+Keep the interceptor Lambda in the gateway's account: AWS's pages do not document a gateway invoking a function in
+another account.
 
 ### Configuration
 
@@ -679,39 +668,33 @@ Everything is an environment variable.
 |---|---|---|
 | `REVA_BASE_URL` | `https://api.reva.ai` | RTG base URL; the path is fixed |
 | `REVA_TOKEN_SECRET`, `REVA_TOKEN_SECRET_KEY` | `reva/secrets`, `RTG_TOKEN` | the Secrets Manager secret holding the RTG credential. **Recommended: set `REVA_TOKEN_SECRET` to the secret's full ARN**; the name is only the fallback, and a secret in another account needs its ARN (see "Several AWS accounts"). It is read on the first evaluated call and every 5 minutes. A plaintext secret is the token; a JSON secret is read at the key. `REVA_TOKEN` is not read: setting it is a configuration error |
-| `REVA_AUTH_MODE` | `api-token` | `api-token` sends `X-API-Token`; `bearer` sends `Authorization: Bearer` (+ `policyStoreId` if set) |
+| `REVA_AUTH_MODE` | `api-token` | `api-token` sends `X-API-Token: Bearer <token>` (the user's JWT stays on `Authorization`); `bearer` sends the token as `Authorization: Bearer` (+ `policyStoreId` if set). The summarize call always uses `Authorization: Bearer` |
 | `REVA_POLICY_STORE_ID` | | optional; sent as `policyStoreId` in bearer mode. Normally unnecessary: the edge gateway takes the store from the token. Needed when the RTG is called directly |
 | `REVA_VERIFY_USER_SCOPE`, `REVA_ORIGIN_APP` | off | send `X-Reva-Verification-Codes: CODE_USER_SCOPE` and `X-API-Origin-App` for the edge's known-user check. `REVA_VERIFY_USER_SCOPE=true` needs `REVA_ORIGIN_APP` (otherwise a configuration error) |
 | `REVA_PROMPT_KEY` | `userQuery` | name of the prompt field in `transmission` (older stores use `content`) |
 | `REVA_TIMEOUT_SECONDS`, `REVA_RETRIES`, `REVA_SAFETY_MARGIN_MS` | `15`, `1`, `2000` | per-attempt timeout, retries, time kept back from the Lambda's own deadline |
 | `REVA_USER_CLAIM` | `sub` | principal claim |
 | `REVA_GROUPS_CLAIM` | off | list claim → `UserGroup` parents |
-| `REVA_AUTHORIZE_AGENT` | `true` | `false`: the user is the subject on every hop |
-| `REVA_AGENT_CLAIMS`, `REVA_AGENT_HEADER`, `REVA_AGENT_ID_MAP` | `act.sub`, `x-reva-agent-id`, `{}` | see "Who is calling" |
 | `REVA_TARGETS` | `{}` | per-target `id` alias, `endpoint`, `kind: skip` |
-| `REVA_CONTEXT_MAP` | `{}` | `{"<argument>": "<Cedar context attribute>"}`. A tool call's arguments are `params.arguments`; an agent call's (A2A) are the message's `metadata`. Only mapped keys are sent, empty values are dropped, and no other context attributes are ever added |
+| `REVA_CONTEXT_FROM_BODY` | `true` | send the name/value pairs of the request body as context (see [context variables](#context-variables)); `false` sends only what `REVA_CONTEXT_MAP` names |
+| `REVA_CONTEXT_MAP` | `{}` | `{"<argument>": "<Cedar context attribute>"}`: sends a call's argument under the attribute name a policy reads. A tool call's arguments are `params.arguments`; an agent call's (A2A) are the `metadata` of the message, the send params and the request. Empty values are dropped; a mapped pair replaces a body pair of the same name |
 | `REVA_UNCLASSIFIED` | `skip` | `deny` refuses HTTP traffic that is neither A2A nor `/<target>/invocations` |
 | `REVA_UNKNOWN_RESOURCE` | `deny` | `unknown` sends `unknown-*` ids instead (reads as allow at the RTG) |
 | `REVA_EVAL_BUILTIN_TOOLS` | `false` | evaluate the gateway's own search tool |
 | `REVA_TOOL_PARENTS` | `false` | also send `MCPServer` as the Tool's parent and tool properties |
 | `REVA_TRACE_HEADER` | off | a header carrying a trace id, for callers that cannot send `traceparent` |
 | `REVA_ON_MISSING_TRACEPARENT` | `mint` | `deny` refuses calls with no trace id. A minted trace has no history |
-| `REVA_HISTORY`, `REVA_HISTORY_TABLE` | `interceptor`, `reva_trace_hop` | `rtg` needs no table. Set the table name only if yours differs |
-| `REVA_HISTORY_PK_ATTR`, `REVA_HISTORY_SK_ATTR` | `pk`, `sk` | the table's partition and sort key names |
-| `REVA_TRACE_TTL_SECONDS`, `REVA_THREAD_TTL_SECONDS` | `3600`, `86400` | |
-| `REVA_MAX_HOPS_SENT`, `REVA_CONTENT_MAX_BYTES`, `REVA_PROMPT_MAX_BYTES` | `30`, `1500`, `12000` | the RTG rejects history over 32 events, 64 KiB, or any string over 16 KiB, so `REVA_MAX_HOPS_SENT` is capped at 30 (the first hop and the newest ones are kept) |
+| `REVA_PROMPT_MAX_BYTES` | `12000` | prompt clipped before it is sent to the RTG |
 | `REVA_FAIL_OPEN`, `REVA_MONITOR_MODE`, `REVA_CONDITIONAL_ALLOW` | `false`, `false`, `deny` | see "Failure behaviour" |
 | `REVA_DENY_MESSAGE`, `REVA_DENY_STATUS` | generic message, `403` | |
 | `REVA_DEBUG` | `false` | log the event's shape and the RTG request body (it contains prompts: development only) |
 
 ## Example: renamed tools and a prefixed policy store
 
-A setup that follows the contract above (a `traceparent` on every call, the user's JWT and a thread id on the first
-call of each prompt, and `X-Reva-Agent-Id` on each agent's own calls) needs little configuration. Three things in
-this example differ from the defaults: the policy store knows the tool server as `acme-mcp` (the gateway target is
-`acme-tools`), it prefixes Cedar attributes with `Acme_`, and its RTG expects bearer authentication and `content` as
-the prompt key. So the interceptor is configured, not changed (`tests/test_example_profile.py` runs this as a
-three-hop question):
+A setup that follows the txn-token contract (a `traceparent`, the user's JWT, a thread id on the entry hop, and
+`X-Transaction-Token` on nested hops) needs only a mapping. Two things in this example differ from the defaults:
+the policy store knows the tool server as `acme-mcp` (the gateway target is `acme-tools`), and it prefixes Cedar
+attributes with `Acme_` (see `tests/test_example_profile.py`):
 
 ```
 REVA_BASE_URL=https://<your RTG host>   REVA_AUTH_MODE=bearer
@@ -729,15 +712,19 @@ Why the last two settings exist, and when you would not need them:
   tools by. A tool id that matches no entity is not denied: no permit and no forbid match it, so it reads as an
   allow. A customer who registers tools as `<gateway target>/<tool>` needs no alias.
 - `REVA_CONTEXT_MAP` copies a call's arguments into the Cedar attributes the policies read (`countries` becomes
-  `Acme_req_countries`). The RTG does not lift arguments into context itself, so without the map a scope
-  `forbid ... when` never matches and the call is allowed. Policies that do not look at arguments need no map.
-  A tool call carries its arguments in `params.arguments`. An agent call (A2A `message/send`) has no argument map,
-  so the caller's free-form `metadata` plays that part: it is read from the message, the send params and the
-  request, the most specific winning a repeated key. An agent that wants a scope policy to judge its hand-off puts
-  the values in `metadata` under names the map lists; the interceptor adds nothing the map does not name.
+  `Acme_req_countries`). The interceptor sends a call's arguments and metadata under their own names too,
+  but this store's policies read the prefixed names, so a scope `forbid ... when` needs the map to match. Policies
+  that read the call's own names need no map. A tool call carries its arguments in `params.arguments`. An agent
+  call (A2A `message/send`) has no argument map, so the caller's free-form `metadata` plays that part: it is read
+  from the message, the send params and the request, the most specific winning a repeated key. An agent that wants
+  a scope policy to judge its hand-off puts the values in `metadata` under names the map lists.
 
 There is no store id in the block: the edge gateway reads it from the token. The token itself is in the Secrets
 Manager secret (`reva/secrets`), not in the block.
+
+Scope values reach the RTG as context: a tool call's arguments or an agent call's A2A `metadata`, under their own
+names and, where `REVA_CONTEXT_MAP` names them, under the policy's attribute names. Agents do not assert hop lists,
+conversation blocks, or scope blocks.
 
 ## Troubleshooting
 
@@ -746,20 +733,17 @@ The Lambda's log group is `/aws/lambda/<function name>`. Useful lines have an `e
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| every call denied, `config_error` | a bad environment variable; the log line names it. Usual suspects: JSON that does not parse in `REVA_TARGETS` or `REVA_CONTEXT_MAP`, a leftover `REVA_TOKEN` (the token now comes from Secrets Manager), a leftover `REVA_HISTORY_KEY_ATTR` from the first version of this interceptor | fix or delete the variable |
-| every call denied, `token_unavailable` | the secret cannot be read: it does not exist under that name in the function's region, the role lacks `secretsmanager:GetSecretValue` on it (or `kms:Decrypt` on its key), or a JSON secret has no field `RTG_TOKEN`; for another account's secret, its resource policy or its key's policy does not allow the role | step 2 and step 3; the log line's reason names the cause |
-| `missing_authorization` | the gateway is not passing headers, or the first call of the trace has no bearer token | step 8: `passRequestHeaders: true`; make the first call carry the user's JWT |
+| every call denied, `config_error` | a bad environment variable; the log line names it. Usual suspects: JSON that does not parse in `REVA_TARGETS` or `REVA_CONTEXT_MAP`, a leftover `REVA_TOKEN` (the token now comes from Secrets Manager) | fix or delete the variable |
+| every call denied, `token_unavailable` | the secret cannot be read: it does not exist under that name in the function's region, the role lacks `secretsmanager:GetSecretValue` on it (or `kms:Decrypt` on its key), or a JSON secret has no field `RTG_TOKEN`; for another account's secret, its resource policy or its key's policy does not allow the role | step 1 and step 2; the log line's reason names the cause |
+| `missing_authorization` | the gateway is not passing headers, or a call has neither a bearer JWT nor a txn token | step 7: `passRequestHeaders: true`; send the user JWT (and txn token on nested hops) |
 | `invalid_authorization` or `principal_unresolved` | the token is not a JWT, or has no `sub` (or the claim in `REVA_USER_CLAIM`) | send the user's JWT; set `REVA_USER_CLAIM` |
-| `AccessDeniedException` for `dynamodb:Query` (or another action), `history_unavailable` | the execution role lacks an action | step 3: all four actions on the table's ARN |
-| `cannot open table` or `ResourceNotFoundException` | the table name or region is wrong | the function reads the table in its own region; check `REVA_HISTORY_TABLE` |
-| nothing is saved in the table | the call carried no `traceparent` (the log says `traceparent_missing`: a minted trace has no history), or every call was denied (hops are recorded only after a permit), or `REVA_HISTORY=rtg` | send the same `traceparent` on every call |
 | `rtg_unavailable` | the RTG cannot be reached from the Lambda, or is slow | check the URL, a VPC without internet, and `REVA_TIMEOUT_SECONDS` against the function timeout |
 | `rtg_unavailable` with status `401` in the log | wrong token or auth mode (with `REVA_FAIL_OPEN=true` these calls would pass instead) | the value of the secret (it may take 5 minutes to be picked up), `REVA_AUTH_MODE` |
-| `rtg_rejected` (the RTG answers `400`) | the request is invalid for the store: the prompt key, or a context attribute the schema does not declare | `REVA_PROMPT_KEY`; check what `REVA_CONTEXT_MAP` sends (`REVA_DEBUG` shows the body) |
+| `rtg_rejected` (the RTG answers `400`) | the request is invalid for the store: the prompt key, or a context attribute the schema does not declare | `REVA_PROMPT_KEY`; check what is sent as context (`REVA_DEBUG` shows the body and names what was left out). A `400` caused by context alone is retried without it |
 | everything is allowed although a policy should block it | the resource id matches no entity in the store, the policy reads an attribute nobody sends, or `REVA_MONITOR_MODE` is on | `REVA_TARGETS`; `REVA_CONTEXT_MAP` and the agents' arguments/`metadata`; turn monitor mode off |
-| the subject is the user, not the agent (`subjectSource: user_fallback`) | the agent sent no `X-Reva-Agent-Id` and the token has no `act.sub` | send the header |
-| a scope policy never fires on an agent-to-agent call | the values are not in the message `metadata`, or their names are not in `REVA_CONTEXT_MAP` | see [what agents must send](#what-agents-must-send) |
-| the gateway reports it cannot invoke the interceptor | the gateway's role lacks `lambda:InvokeFunction` on the function | step 7 |
+| nested hop still sends User in the body (`subjectSource: user`) | prior hop's transaction token was not forwarded | forward `X-Transaction-Token` from the previous allow |
+| a scope policy never fires on an agent-to-agent call | the values are not in the `metadata`, their names differ from the policy's (and are not in `REVA_CONTEXT_MAP`), or the value was left out by a [context rule](#context-variables) (a decimal, a name like `password`, more than 512 bytes) | see [what agents must send](#what-agents-must-send); `REVA_DEBUG` names what was left out |
+| the gateway reports it cannot invoke the interceptor | the gateway's role lacks `lambda:InvokeFunction` on the function | step 6 |
 
 ## Tests
 
@@ -767,17 +751,18 @@ The Lambda's log group is `/aws/lambda/<function name>`. Useful lines have an `e
 python3 -m unittest discover -s tests -t .
 ```
 
-No network and no AWS account: a loopback server stands in for the RTG, an in-memory store for the table, and
-botocore's `Stubber` checks every DynamoDB request against the service model. It cannot judge the expressions'
-semantics; the first run against a real table does.
+No network and no AWS account: a loopback server stands in for the RTG.
 
 ## Not in v1
 
-- evaluating inference/LLM traffic (an `invokeModel` hop on a `Model`)
-- a `RESPONSE` interceptor: capturing answers, earlier-prompt `session.messages`, screening tool results
+- screening / redacting tool or model **results** on the RESPONSE leg (summarize only)
 - `tools/list` filtering
 - an attach script: the CloudFormation template creates the resources but does not attach the interceptor to an existing gateway
 - an allow-list for agent ids
+
+**Now included:** `invokeModel` on gateway inference / OpenAI-compatible chat bodies, and RESPONSE
+`/trace/summarize` for `session.messages` (agents that call the LLM *outside* the gateway still
+produce no model hop — point them at `AGENTCORE_LLM_URL` on the gateway).
 
 ## License
 

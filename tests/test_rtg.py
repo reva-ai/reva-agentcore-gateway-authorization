@@ -5,7 +5,8 @@ from unittest import mock
 from interceptor import rtg
 from interceptor.classify import Call
 from interceptor.rtg import (ALLOW, CONDITIONAL, OPERATIONAL, POLICY_DENY, REJECTED,
-                             build_request, evaluate, interpret, request_headers)
+                             build_request, evaluate, interpret, request_headers,
+                             summarize_headers)
 
 from .support import TOKEN, TRACE, FakeRTG, settings
 
@@ -20,53 +21,50 @@ USER = {"type": "User", "id": "u1"}
 
 
 def body_for(cfg, **overrides):
-    args = dict(call=tool_call(), principal="u1", subject=USER, role="assistant",
-                thread_id="chat", turn=2, started_at="2026-10-27T08:00:00.000000Z",
-                hops=[], messages=[], groups=[])
+    args = dict(call=tool_call(), principal="u1", subject=USER, role="assistant", groups=[])
     args.update(overrides)
     return build_request(cfg, **args)
 
 
 class BuildRequest(unittest.TestCase):
     def test_shape_for_a_tool_call(self):
-        body = body_for(settings())
-        self.assertEqual(body["subject"], USER)
-        self.assertEqual(body["principal"], USER)
-        self.assertEqual(body["action"], {"name": "invokeTool"})
-        self.assertEqual(body["resource"]["id"], "srv/tool")
-        self.assertEqual(body["transmission"], {
-            "promptKey": "userQuery", "userQuery": '{"q":1}', "role": "assistant",
+        body = body_for(settings(), thread_id="chat-1")
+        a2a = body["rtg/a2a"]
+        self.assertEqual(body["content"], '{"q":1}')
+        self.assertEqual(a2a["subject"], USER)
+        self.assertEqual(a2a["principal"], USER)
+        self.assertEqual(a2a["action"], {"name": "invokeTool"})
+        self.assertEqual(a2a["resource"]["id"], "srv/tool")
+        self.assertEqual(a2a["transmission"], {
+            "promptKey": "content", "content": '{"q":1}', "role": "assistant",
             "contentType": "text/plain"})
-        self.assertEqual(body["session"], {"id": "chat", "turn": 2,
-                                           "startedAt": "2026-10-27T08:00:00.000000Z"})
-        self.assertEqual(body["context"], {"hops": []})      # sent, empty, on a first call
-        self.assertNotIn("entities", body)
-
-    def test_history_is_sent_paired_and_conversation_only_when_non_empty(self):
-        hops = [{"seq": 1, "subject": USER, "action": "invokeAgent",
-                 "resource": {"type": "Agent", "id": "a"}, "time": "t"}]
-        messages = [{"seq": 1, "role": "user", "contentType": "text/plain", "content": "hi",
-                     "timestamp": "t"}]
-        context = body_for(settings(), hops=hops, messages=messages)["context"]
-        self.assertEqual(context["hops"], hops)
-        self.assertEqual(context["conversation"], {"messages": messages})
-
-    def test_rtg_history_mode_sends_neither_history_nor_session(self):
-        body = body_for(settings(REVA_HISTORY="rtg"), hops=[{"seq": 1}], messages=[{"seq": 1}])
+        self.assertEqual(a2a["threadId"], "chat-1")
+        self.assertEqual(a2a["session"], {"id": "chat-1"})
+        # RTG owns hops: body carries neither hops nor a root session duplicate.
         self.assertNotIn("session", body)
-        self.assertNotIn("context", body)
+        self.assertNotIn("context", a2a)
+        self.assertNotIn("entities", a2a)
 
     def test_custom_prompt_key(self):
-        body = body_for(settings(REVA_PROMPT_KEY="content"))
-        self.assertEqual(body["transmission"]["promptKey"], "content")
-        self.assertEqual(body["transmission"]["content"], '{"q":1}')
-        self.assertNotIn("userQuery", body["transmission"])
+        body = body_for(settings(REVA_PROMPT_KEY="userQuery"))
+        a2a = body["rtg/a2a"]
+        self.assertEqual(a2a["transmission"]["promptKey"], "userQuery")
+        self.assertEqual(a2a["transmission"]["userQuery"], '{"q":1}')
+        self.assertEqual(body["userQuery"], '{"q":1}')
+        self.assertNotIn("content", a2a["transmission"])
+
+    def test_omit_subject_for_nested_txn_hop(self):
+        body = body_for(settings(), omit_subject=True, thread_id="t1")
+        a2a = body["rtg/a2a"]
+        self.assertNotIn("subject", a2a)
+        self.assertNotIn("principal", a2a)
+        self.assertEqual(a2a["threadId"], "t1")
 
     def test_context_map_lifts_arguments_and_drops_empty_values(self):
         cfg = settings(REVA_CONTEXT_MAP='{"countries": "Org_req_countries", "years": "Org_req_years",'
                                         ' "clients": "Org_req_clients", "n": "Org_n"}')
         call = tool_call(countries=["ES", "FR"], years=[], clients="", n=0)
-        context = body_for(cfg, call=call)["context"]
+        context = body_for(cfg, call=call)["rtg/a2a"]["context"]
         self.assertEqual(context["Org_req_countries"], ["ES", "FR"])
         self.assertEqual(context["Org_n"], 0)                 # zero is a value, not empty
         self.assertNotIn("Org_req_years", context)            # an empty set fails validation
@@ -74,7 +72,7 @@ class BuildRequest(unittest.TestCase):
 
     def test_groups_become_a_user_entity_with_group_parents(self):
         body = body_for(settings(), groups=["admins", "eu"])
-        self.assertEqual(body["entities"], [{"uid": USER, "parents": [
+        self.assertEqual(body["rtg/a2a"]["entities"], [{"uid": USER, "parents": [
             {"type": "UserGroup", "id": "admins"}, {"type": "UserGroup", "id": "eu"}]}])
 
 
@@ -84,12 +82,37 @@ class Headers(unittest.TestCase):
 
     def test_api_token_mode(self):
         headers = self.names()
-        self.assertEqual(headers["X-API-Token"], TOKEN)
+        self.assertEqual(headers["X-API-Token"], f"Bearer {TOKEN}")
+        self.assertEqual(headers["X-Reva-Token-Request"], "transaction")
         self.assertEqual(headers["traceparent"], f"00-{TRACE}-{'b' * 16}-01")
         self.assertEqual(headers["X-Reva-Thread-Id"], "chat")
         self.assertEqual(headers["x-ms-correlation-id"], TRACE)
         for absent in ("Authorization", "policyStoreId", "X-API-Origin-App"):
             self.assertNotIn(absent, headers)
+
+    def test_api_token_mode_forwards_user_jwt_and_txn_token(self):
+        headers = dict(request_headers(
+            settings(), TRACE, "b" * 16, "chat",
+            user_bearer="user.jwt.here", txn_token="txn.jwt.here"))
+        self.assertEqual(headers["X-API-Token"], f"Bearer {TOKEN}")
+        self.assertEqual(headers["Authorization"], "Bearer user.jwt.here")
+        self.assertEqual(headers["X-Transaction-Token"], "txn.jwt.here")
+
+    def test_the_thread_header_is_sent_only_when_there_is_a_thread(self):
+        # a nested hop carries the prior transaction token and no thread id
+        headers = dict(request_headers(settings(), TRACE, "b" * 16, "", txn_token="txn.jwt.here"))
+        self.assertNotIn("X-Reva-Thread-Id", headers)
+        self.assertEqual(headers["X-Transaction-Token"], "txn.jwt.here")
+
+    def test_summarize_authenticates_with_authorization_bearer_in_both_modes(self):
+        for mode in ("api-token", "bearer"):
+            headers = dict(summarize_headers(settings(REVA_AUTH_MODE=mode), "chat"))
+            self.assertEqual(headers["Authorization"], f"Bearer {TOKEN}", mode)
+            self.assertEqual(headers["X-Reva-Thread-Id"], "chat")
+            self.assertNotIn("X-API-Token", headers)
+            self.assertNotIn("X-API-Origin-App", headers)
+        origin = dict(summarize_headers(settings(REVA_ORIGIN_APP="aws-agentcore")))
+        self.assertEqual(origin["X-API-Origin-App"], "aws-agentcore")
 
     def test_bearer_mode_sends_the_policy_store_id_only_when_set(self):
         headers = self.names(REVA_AUTH_MODE="bearer", REVA_POLICY_STORE_ID="store-1")
@@ -108,12 +131,16 @@ class Interpret(unittest.TestCase):
     def test_status_table(self):
         cases = [
             (200, '{"decision": true}', ALLOW),
-            (200, '{}', ALLOW),
+            (200, '{}', POLICY_DENY),                       # a 2xx without decision:true is no allow
+            (200, '{"token": "t"}', POLICY_DENY),
             (200, '{"decision": false, "context": {"reason": "nope"}}', POLICY_DENY),
             (200, '{"guardrails": {"outcome": "conditional_allow", "reason": "review"}}', CONDITIONAL),
             (200, 'not json', OPERATIONAL),
             (403, '{"decision": false, "context": {"reason": "forbid matched"}}', POLICY_DENY),
-            (403, '', POLICY_DENY),
+            (403, '{"decision": false}', POLICY_DENY),
+            (403, '{"error_type": "POLICY_DENIED"}', POLICY_DENY),
+            (403, '', OPERATIONAL),                         # an edge or proxy refusing: no verdict
+            (403, '{"message": "Forbidden"}', OPERATIONAL),
             (401, '{"error_type": "USER_NOT_FOUND"}', POLICY_DENY),
             (401, '{"error_type": "USER_DISABLED"}', POLICY_DENY),
             (401, '{"error_type": "UNAUTHORIZED"}', OPERATIONAL),
@@ -155,9 +182,9 @@ class Evaluate(unittest.TestCase):
     def test_request_goes_to_the_evaluation_path_as_json(self):
         with FakeRTG() as server:
             decision = self.run_against(server)
-            self.assertEqual(server.requests[0]["path"], "/pdp/v2/ai/evaluation")
+            self.assertEqual(server.requests[0]["path"], "/pdp/ai/access/ai/evaluation")
             self.assertEqual(server.requests[0]["json"], {"x": 1})
-            self.assertEqual(server.header("X-API-Token"), TOKEN)
+            self.assertEqual(server.header("X-API-Token"), f"Bearer {TOKEN}")
         self.assertEqual((decision.outcome, decision.status, decision.attempts), (ALLOW, 200, 1))
 
     def test_a_transient_fault_is_retried_once(self):
@@ -175,10 +202,11 @@ class Evaluate(unittest.TestCase):
         self.assertEqual((decision.outcome, decision.status), (OPERATIONAL, 500))
 
     def test_decisions_and_our_own_errors_are_never_retried(self):
-        for status, expected in ((403, POLICY_DENY), (400, REJECTED), (404, OPERATIONAL),
-                                 (413, OPERATIONAL)):
+        for status, expected, body in ((403, POLICY_DENY, {"decision": False}), (403, OPERATIONAL, {}),
+                                       (400, REJECTED, {}), (404, OPERATIONAL, {}),
+                                       (413, OPERATIONAL, {})):
             with FakeRTG() as server:
-                server.default = {"status": status, "body": {}}
+                server.default = {"status": status, "body": body}
                 decision = self.run_against(server)
                 self.assertEqual(len(server.requests), 1, status)
             self.assertEqual(decision.outcome, expected, status)

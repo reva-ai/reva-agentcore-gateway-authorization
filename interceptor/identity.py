@@ -1,15 +1,11 @@
-"""Who is calling: the principal, the groups, and the agent (if any).
+"""Who is calling: the principal and groups from the gateway-validated JWT.
 
 The gateway has already validated the bearer JWT, so its payload is decoded
 without re-verifying the signature. Nothing here ever logs a token.
 
 principal  the human (or the client, for a machine token): one claim, default `sub`.
-           Resolved once per trace, on the trace's first call, then read from the
-           trace record by every later hop.
-agent      only when REVA_AUTHORIZE_AGENT is on. The gateway event carries no
-           caller identity, so it comes from a token claim (RFC 8693 `act.sub`)
-           or, failing that, a header the agent sets. Unresolved means "the
-           user is acting", never a guess.
+Agent subject on nested hops is derived by the RTG from X-Transaction-Token,
+not from a body field or X-Reva-Agent-Id header.
 """
 
 from __future__ import annotations
@@ -90,31 +86,3 @@ def resolve_principal(headers: Mapping[str, str], cfg: Settings
     if not principal:
         return None, [], "principal_unresolved"
     return principal, claim_list(claims, cfg.groups_claim), ""
-
-
-def resolve_agent(headers: Mapping[str, str], cfg: Settings) -> Tuple[Optional[str], str]:
-    """(agent id or None, source). The source is for the log, never for a decision."""
-    if not cfg.authorize_agent:
-        return None, "authorize_agent_off"
-
-    value, source = None, ""
-    if cfg.agent_claims:
-        claims = jwt_claims(bearer_token(headers))
-        for claim in cfg.agent_claims:
-            found = claim_value(claims, claim)
-            if found:
-                value, source = found, f"claim:{claim}"
-                break
-    if not value:
-        header = headers.get(cfg.agent_header, "").strip()
-        if header:
-            value, source = header[:MAX_ID_CHARS], f"header:{cfg.agent_header}"
-    if not value:
-        return None, "user_fallback"
-    return cfg.agent_id_map.get(value, value), source
-
-
-def subject_for(principal: str, agent_id: Optional[str]) -> Dict[str, str]:
-    if agent_id:
-        return {"type": "Agent", "id": agent_id}
-    return {"type": "User", "id": principal}
