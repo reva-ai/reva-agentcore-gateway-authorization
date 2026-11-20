@@ -34,7 +34,7 @@ def traceparent(trace: str = TRACE, span: str = "b" * 16) -> str:
 def settings(**overrides: str) -> Settings:
     """Settings from a clean environment, plus the given REVA_* overrides. The RTG token is
     already in place: the deployed function reads it from Secrets Manager, not the environment."""
-    env = {"REVA_HISTORY_TABLE": "table", "REVA_BASE_URL": "http://127.0.0.1:9"}
+    env = {"REVA_BASE_URL": "http://127.0.0.1:9"}
     env.update(overrides)
     return dataclasses.replace(Settings.from_env(env), token=TOKEN)
 

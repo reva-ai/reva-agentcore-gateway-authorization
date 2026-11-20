@@ -8,9 +8,9 @@ The gateway sends two shapes (AgentCore developer guide, "interceptor types"):
                             "gatewayResponse": {...}}}                 (Runtime/A2A, passthrough)
 
 `headers` is present only when the interceptor is attached with passRequestHeaders.
-On the HTTP RESPONSE leg `gatewayRequest` is null, so a response leg cannot be
-tied back to its request there; this interceptor is REQUEST-only and passes any
-response through untouched.
+On the HTTP RESPONSE leg `gatewayRequest` is null (AgentCore), so correlation for
+`/trace/summarize` comes from `_reva` in the response body (Runtime agents) or
+from MCP's still-present `gatewayRequest` headers.
 """
 
 from __future__ import annotations

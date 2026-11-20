@@ -3,20 +3,18 @@ import contextlib
 import dataclasses
 import io
 import json
-import threading
 import unittest
 from unittest import mock
 
 from interceptor import decide, rtg
-from interceptor.history import MemoryStore, StoreError
 from interceptor.secret import SecretError
 
-from .support import (OTHER_TRACE, TOKEN, TRACE, FakeRTG, a2a_payload, bearer, http_event,
+from .support import (TOKEN, TRACE, FakeRTG, a2a_payload, bearer, http_event,
                       make_jwt, mcp_event, settings, traceparent)
 
 
 class Harness:
-    """The pipeline against a fake RTG and an in-memory store."""
+    """The pipeline against a fake RTG."""
 
     def __init__(self, **env):
         self.env = env
@@ -25,7 +23,6 @@ class Harness:
     def __enter__(self):
         self.server.__enter__()
         self.cfg = settings(REVA_BASE_URL=self.server.url, **self.env)
-        self.store = MemoryStore(self.cfg)
         self._sleep = mock.patch.object(rtg, "_sleep", lambda _: None)
         self._sleep.start()
         return self
@@ -34,15 +31,19 @@ class Harness:
         self._sleep.stop()
         self.server.__exit__(*exc)
 
-    def run(self, event, store="default"):
+    def run(self, event):
         buffer = io.StringIO()
         with contextlib.redirect_stdout(buffer):
-            out = decide.handle(event, None, self.cfg,
-                                self.store if store == "default" else store)
+            out = decide.handle(event, None, self.cfg)
         return out, buffer.getvalue()
 
     @property
     def body(self):
+        """The `rtg/a2a` envelope (token-evaluation shape)."""
+        return self.server.requests[-1]["json"]["rtg/a2a"]
+
+    @property
+    def root_body(self):
         return self.server.requests[-1]["json"]
 
     def log(self, logs, event="decision"):
@@ -75,8 +76,8 @@ def deny_code(out):
     return block["body"]["error"]["data"]["code"]
 
 
-class FirstCallAndLaterHops(unittest.TestCase):
-    def test_first_mcp_call_is_evaluated_and_recorded(self):
+class Evaluation(unittest.TestCase):
+    def test_mcp_call_is_evaluated(self):
         with Harness() as h:
             out, logs = h.run(tool_event())
             self.assertTrue(passed(out))
@@ -85,73 +86,46 @@ class FirstCallAndLaterHops(unittest.TestCase):
             self.assertEqual(body["subject"], {"type": "User", "id": "u1"})
             self.assertEqual(body["action"], {"name": "invokeTool"})
             self.assertEqual(body["resource"]["id"], "srv/tool")
-            self.assertEqual(body["session"]["id"], "chat-1")
-            self.assertEqual(body["session"]["turn"], 1)
-            self.assertEqual(body["context"], {"hops": []})
+            self.assertEqual(body["session"], {"id": "chat-1"})
+            self.assertEqual(body["context"], {"q": 1})     # the tool's arguments, by name
+            self.assertIn("rtg/a2a", h.root_body)
             self.assertEqual(h.server.header("X-Reva-Thread-Id"), "chat-1")
+            self.assertEqual(h.server.header("X-Reva-Token-Request"), "transaction")
             self.assertTrue(h.server.header("traceparent").startswith(f"00-{TRACE}-"))
-            record = h.store.get_trace(TRACE)
-            self.assertEqual((record["principal"], record["thread_id"]), ("u1", "chat-1"))
-            self.assertEqual(record["hops"][0]["resource"], {"type": "Tool", "id": "srv/tool"})
             entry = h.log(logs)
-            self.assertEqual((entry["decision"], entry["firstCall"], entry["traceSource"]),
-                             ("permit", True, "traceparent"))
+            self.assertEqual((entry["decision"], entry["traceSource"]),
+                             ("permit", "traceparent"))
 
-    def test_a_later_hop_needs_no_jwt_and_sees_the_history(self):
+    def test_a_later_hop_needs_the_jwt_and_sends_no_hops(self):
         with Harness() as h:
             h.run(tool_event("srv___first"))
-            # No user JWT, no thread id, no session: only the traceparent.
-            h.run(mcp_event("srv___second", {"q": 2},
-                            headers={"traceparent": traceparent()}))
-            body = h.body
-            self.assertEqual(body["principal"]["id"], "u1")           # read from the table
-            self.assertEqual(body["session"]["id"], "chat-1")
-            self.assertEqual(h.server.header("X-Reva-Thread-Id"), "chat-1")
-            self.assertEqual(len(body["context"]["hops"]), 1)
-            self.assertEqual(body["context"]["hops"][0]["resource"]["id"], "srv/first")
-            self.assertEqual(len(body["context"]["conversation"]["messages"]), 1)
-            self.assertEqual([m["seq"] for m in body["context"]["conversation"]["messages"]],
-                             [h["seq"] for h in body["context"]["hops"]])
-
-    def test_a_later_hop_may_carry_a_different_token_without_changing_the_principal(self):
-        with Harness() as h:
-            h.run(tool_event("srv___first"))
-            other = headers(authorization=False, Authorization=bearer({"sub": "agent-client"}))
-            h.run(mcp_event("srv___second", {"q": 2}, headers=other))
+            later = mcp_event("srv___second", {"q": 2},
+                              headers={"traceparent": traceparent()})
+            self.assertEqual(deny_code(h.run(later)[0]), "missing_authorization")
+            h.run(mcp_event("srv___second", {"q": 2}, headers=headers()))
             self.assertEqual(h.body["principal"]["id"], "u1")
+            self.assertEqual(h.body["session"], {"id": "chat-1"})
+            self.assertEqual(h.body["context"], {"q": 2})   # each hop describes its own call
+            self.assertEqual(h.server.header("X-Reva-Thread-Id"), "chat-1")
 
-    def test_groups_are_stored_and_sent_on_later_hops(self):
+    def test_groups_are_read_from_the_jwt_on_every_hop(self):
         with Harness(REVA_GROUPS_CLAIM="cognito:groups") as h:
-            first = headers(authorization=False,
-                            Authorization=bearer({"sub": "u1", "cognito:groups": ["admins"]}))
-            h.run(mcp_event("srv___a", {"q": 1}, headers=first))
-            h.run(mcp_event("srv___b", {"q": 2}, headers={"traceparent": traceparent()}))
+            auth = headers(authorization=False,
+                           Authorization=bearer({"sub": "u1", "cognito:groups": ["admins"]}))
+            h.run(mcp_event("srv___a", {"q": 1}, headers=auth))
+            h.run(mcp_event("srv___b", {"q": 2}, headers=auth))
             self.assertEqual(h.body["entities"][0]["parents"],
                              [{"type": "UserGroup", "id": "admins"}])
-
-    def test_a_second_prompt_in_the_same_chat_is_turn_two(self):
-        with Harness() as h:
-            h.run(tool_event(trace=TRACE))
-            h.run(tool_event(trace=OTHER_TRACE))
-            self.assertEqual(h.body["session"]["turn"], 2)
-            self.assertEqual(h.body["context"], {"hops": []})          # a fresh prompt, no hops
-
-    def test_startedAt_is_the_chats_and_stable(self):
-        with Harness() as h:
-            h.run(tool_event(trace=TRACE))
-            first = h.body["session"]["startedAt"]
-            h.run(tool_event(trace=OTHER_TRACE))
-            self.assertEqual(h.body["session"]["startedAt"], first)
 
     def test_no_thread_id_anywhere_makes_the_prompt_its_own_chat(self):
         with Harness() as h:
             event = mcp_event("srv___t", {"q": 1}, headers={
                 "traceparent": traceparent(), "Authorization": bearer()})
             _, logs = h.run(event)
-            self.assertEqual(h.body["session"]["id"], TRACE)
+            self.assertEqual(h.server.header("X-Reva-Thread-Id"), TRACE)
             self.assertEqual(h.log(logs, "warn")["code"], "thread_missing")
 
-    def test_first_call_without_a_token_is_denied_locally_and_the_rtg_is_not_asked(self):
+    def test_call_without_a_token_is_denied_locally_and_the_rtg_is_not_asked(self):
         with Harness() as h:
             out, logs = h.run(tool_event(authorization=False))
             self.assertTrue(denied(out))
@@ -166,57 +140,18 @@ class FirstCallAndLaterHops(unittest.TestCase):
                 authorization=False, Authorization=bearer({"email": "x@y"})))
             self.assertEqual(deny_code(h.run(event)[0]), "principal_unresolved")
 
-    def test_gateway_retry_of_the_same_call_is_recorded_once_and_is_not_its_own_history(self):
-        with Harness() as h:
-            event = tool_event()
-            h.run(event)
-            h.run(event)
-            self.assertEqual(len(h.store.get_trace(TRACE)["hops"]), 1)
-            self.assertEqual(h.body["context"]["hops"], [])
-
-    def test_parallel_first_calls_agree_on_one_principal(self):
-        with Harness() as h:
-            barrier = threading.Barrier(2)
-            real = h.store.get_trace
-
-            def synchronised(trace):
-                result = real(trace)
-                barrier.wait(timeout=5)       # both calls see "no record" before either writes
-                return result
-
-            h.store.get_trace = synchronised
-
-            def call(sub):
-                event = mcp_event("srv___t", {"q": sub}, headers=headers(
-                    authorization=False, Authorization=bearer({"sub": sub})))
-                decide.handle(event, None, h.cfg, h.store)
-
-            threads = [threading.Thread(target=call, args=(s,)) for s in ("alice", "mallory")]
-            with contextlib.redirect_stdout(io.StringIO()):    # one redirect: it is process-wide
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join()
-            principals = {r["json"]["principal"]["id"] for r in h.server.requests}
-            self.assertEqual(len(principals), 1)
-
 
 class Enforcement(unittest.TestCase):
-    def test_a_policy_deny_is_enforced_and_not_recorded(self):
+    def test_a_policy_deny_is_enforced(self):
         with Harness() as h:
-            h.run(tool_event("srv___first"))
             h.server.queue(403, {"decision": False, "context": {"reason": "forbid matched"}})
             out, logs = h.run(tool_event("srv___second"))
             self.assertTrue(denied(out))
             self.assertEqual(deny_code(out), "policy_denied")
             message = out["mcp"]["transformedGatewayResponse"]["body"]["error"]["message"]
             self.assertEqual(message, "Blocked by your organization's security policy.")
-            self.assertNotIn("forbid matched", json.dumps(out))          # reason stays in the log
+            self.assertNotIn("forbid matched", json.dumps(out))
             self.assertEqual(h.log(logs)["reason"], "forbid matched")
-            self.assertEqual(len(h.store.get_trace(TRACE)["hops"]), 1)   # the denied call is absent
-            h.run(tool_event("srv___third"))
-            self.assertEqual([x["resource"]["id"] for x in h.body["context"]["hops"]],
-                             ["srv/first"])
 
     def test_monitor_mode_logs_the_denial_and_lets_the_call_through(self):
         with Harness(REVA_MONITOR_MODE="true") as h:
@@ -224,29 +159,78 @@ class Enforcement(unittest.TestCase):
             out, logs = h.run(tool_event())
             self.assertTrue(passed(out))
             self.assertEqual(h.log(logs)["decision"], "monitor_would_deny")
-            self.assertEqual(len(h.store.get_trace(TRACE)["hops"]), 1)
 
     def test_dependency_failure_fails_closed_by_default(self):
         with Harness() as h:
             h.server.default = {"status": 500, "body": {}}
             out, _ = h.run(tool_event())
             self.assertEqual(deny_code(out), "rtg_unavailable")
-            self.assertEqual(len(h.server.requests), 2)                  # one retry
+            self.assertEqual(len(h.server.requests), 2)
 
-    def test_fail_open_passes_on_a_dependency_failure_and_does_not_record_the_hop(self):
+    def test_fail_open_passes_on_a_dependency_failure(self):
         with Harness(REVA_FAIL_OPEN="true") as h:
             h.server.default = {"status": 503, "body": {}}
             out, logs = h.run(tool_event())
             self.assertTrue(passed(out))
             self.assertEqual(h.log(logs)["decision"], "permit_fail_open")
-            self.assertEqual(h.store.get_trace(TRACE)["hops"], [])
 
     def test_fail_open_never_covers_a_policy_deny_or_an_invalid_request(self):
         with Harness(REVA_FAIL_OPEN="true") as h:
             h.server.queue(403, {"decision": False})
             self.assertEqual(deny_code(h.run(tool_event())[0]), "policy_denied")
+            # The call carries context, so a 400 is retried without it: both are refused.
+            h.server.queue(400, {"context": {"reason": "invalid session"}})
             h.server.queue(400, {"context": {"reason": "invalid session"}})
             self.assertEqual(deny_code(h.run(tool_event("srv___other"))[0]), "rtg_rejected")
+
+    def test_a_request_refused_because_of_its_context_is_evaluated_again_without_it(self):
+        with Harness() as h:
+            h.server.queue(400, {"context": {"reason": "invalid Cedar context"}})
+            out, logs = h.run(tool_event(args={"channel": "web"}))
+            self.assertTrue(passed(out))
+            first, second = (r["json"]["rtg/a2a"] for r in h.server.requests[-2:])
+            self.assertEqual(first["context"], {"channel": "web"})
+            self.assertNotIn("context", second)
+            self.assertEqual(second["resource"], first["resource"])
+            self.assertEqual(h.log(logs, "warn")["code"], "context_refused")
+
+    def test_a_400_without_context_is_not_retried(self):
+        with Harness() as h:
+            h.server.queue(400, {"context": {"reason": "invalid session"}})
+            out, _ = h.run(mcp_event("srv___tool", {}, headers=headers()))
+            self.assertEqual(deny_code(out), "rtg_rejected")
+            self.assertEqual(len(h.server.requests), 1)
+
+    def test_what_context_left_out_is_logged_by_name_in_debug_only(self):
+        args = {"password": "hunter2", "q": 1}
+        with Harness(REVA_DEBUG="true") as h:
+            _, logs = h.run(tool_event(args=args))
+            self.assertEqual(h.body["context"], {"q": 1})
+            self.assertEqual(h.log(logs, "debug_context_left_out")["pairs"],
+                             ["password (name looks like a credential)"])
+        with Harness() as h:
+            _, logs = h.run(tool_event(args=args))
+            self.assertNotIn("debug_context_left_out", logs)
+            self.assertNotIn("hunter2", logs)
+
+    def test_a_200_without_an_allow_decision_is_a_deny(self):
+        with Harness() as h:
+            h.server.default = {"status": 200, "body": {"token": "t"}}
+            out, _ = h.run(tool_event())
+            self.assertEqual(deny_code(out), "policy_denied")
+
+    def test_a_403_that_is_not_a_verdict_is_a_dependency_failure_not_a_policy_deny(self):
+        refusal = {"status": 403, "body": {"message": "Forbidden"}}      # an edge or proxy, no decision
+        with Harness() as h:
+            h.server.default = refusal
+            out, _ = h.run(tool_event())
+            self.assertEqual(deny_code(out), "rtg_unavailable")
+        with Harness(REVA_MONITOR_MODE="true") as h:                     # monitor mode must not wave it through
+            h.server.default = refusal
+            self.assertTrue(denied(h.run(tool_event())[0]))
+        with Harness(REVA_FAIL_OPEN="true") as h:                        # fail-open covers it
+            h.server.default = refusal
+            self.assertTrue(passed(h.run(tool_event())[0]))
 
     def test_conditional_allow_is_denied_unless_configured(self):
         body = {"guardrails": {"outcome": "conditional_allow", "reason": "review"}}
@@ -256,15 +240,6 @@ class Enforcement(unittest.TestCase):
         with Harness(REVA_CONDITIONAL_ALLOW="allow") as h:
             h.server.queue(200, body)
             self.assertTrue(passed(h.run(tool_event())[0]))
-
-    def test_a_denied_first_call_still_leaves_the_identity_for_parallel_hops(self):
-        with Harness() as h:
-            h.server.queue(403, {"decision": False})
-            h.run(tool_event("srv___first"))
-            record = h.store.get_trace(TRACE)
-            self.assertEqual((record["principal"], record["hops"]), ("u1", []))
-            h.run(mcp_event("srv___second", {"q": 2}, headers={"traceparent": traceparent()}))
-            self.assertEqual(h.body["principal"]["id"], "u1")
 
     def test_custom_deny_message_and_status(self):
         with Harness(REVA_DENY_MESSAGE="No.", REVA_DENY_STATUS="451") as h:
@@ -276,40 +251,42 @@ class Enforcement(unittest.TestCase):
             self.assertEqual(block["body"]["id"], 1)
 
 
-class AgentSubject(unittest.TestCase):
-    def test_default_without_an_agent_id_the_user_is_the_subject(self):
+class SubjectAndTxnToken(unittest.TestCase):
+    def test_entry_hop_subject_is_always_the_user(self):
         with Harness() as h:
-            _, logs = h.run(tool_event())
+            _, logs = h.run(tool_event(**{"x-reva-agent-id": "ignored-agent"}))
             self.assertEqual(h.body["subject"], {"type": "User", "id": "u1"})
-            self.assertEqual(h.log(logs)["subjectSource"], "user_fallback")
+            self.assertEqual(h.log(logs)["subjectSource"], "user")
 
-    def test_the_agent_header_makes_the_agent_the_subject_and_is_remembered_in_the_hop(self):
+    def test_the_first_call_of_a_turn_is_role_user_whatever_it_is(self):
         with Harness() as h:
-            h.run(tool_event("srv___first", **{"x-reva-agent-id": "agent-a"}))
-            self.assertEqual(h.body["subject"], {"type": "Agent", "id": "agent-a"})
-            self.assertEqual(h.body["principal"], {"type": "User", "id": "u1"})
-            h.run(tool_event("srv___second", **{"x-reva-agent-id": "agent-b"}))
-            self.assertEqual(h.body["context"]["hops"][0]["subject"],
-                             {"type": "Agent", "id": "agent-a"})
+            h.run(tool_event())                                # an MCP tool call as the first call
+            self.assertEqual(h.body["transmission"]["role"], "user")
 
-    def test_a_token_claim_beats_the_header(self):
+    def test_a_nested_hop_sends_no_thread_even_if_the_call_carries_one(self):
         with Harness() as h:
-            token = bearer({"sub": "u1", "act": {"sub": "from-token"}})
-            event = mcp_event("srv___t", {"q": 1}, headers=headers(
-                authorization=False, Authorization=token, **{"x-reva-agent-id": "from-header"}))
-            h.run(event)
-            self.assertEqual(h.body["subject"]["id"], "from-token")
+            _, logs = h.run(tool_event(**{"x-transaction-token": "prior.txn.jwt",
+                                          "X-Reva-Thread-Id": "chat-7", "Mcp-Session-Id": "chat-7"}))
+            self.assertNotIn("session", h.body)
+            self.assertNotIn("threadId", h.body)
+            self.assertIsNone(h.server.header("X-Reva-Thread-Id"))
+            self.assertEqual(h.log(logs)["threadSource"], "nested_hop")
+            self.assertEqual(h.body["transmission"]["role"], "agent")
 
-    def test_switching_authorize_agent_off_ignores_any_agent_id(self):
-        with Harness(REVA_AUTHORIZE_AGENT="false") as h:
-            h.run(tool_event(**{"x-reva-agent-id": "agent-a"}))
-            self.assertEqual(h.body["subject"], {"type": "User", "id": "u1"})
+    def test_a_transaction_token_sent_with_a_bearer_prefix_is_forwarded_bare(self):
+        with Harness() as h:
+            h.run(tool_event(**{"x-transaction-token": "Bearer prior.txn.jwt"}))
+            self.assertEqual(h.server.header("X-Transaction-Token"), "prior.txn.jwt")
 
-    def test_configured_header_and_id_map(self):
-        with Harness(REVA_AGENT_HEADER="X-Caller-Agent",
-                     REVA_AGENT_ID_MAP='{"orchestrator": "acme-orchestrator"}') as h:
-            h.run(tool_event(**{"x-caller-agent": "orchestrator"}))
-            self.assertEqual(h.body["subject"]["id"], "acme-orchestrator")
+    def test_nested_hop_omits_subject_when_txn_token_present(self):
+        with Harness() as h:
+            h.server.default = {"status": 200, "body": {"decision": True, "token": "minted.txn"}}
+            out, logs = h.run(tool_event(**{"x-transaction-token": "prior.txn.jwt"}))
+            self.assertTrue(passed(out))
+            self.assertNotIn("subject", h.body)
+            self.assertNotIn("principal", h.body)
+            self.assertEqual(h.server.header("X-Transaction-Token"), "prior.txn.jwt")
+            self.assertEqual(h.log(logs)["subjectSource"], "transaction_token")
 
 
 class A2aAndRuntime(unittest.TestCase):
@@ -323,17 +300,19 @@ class A2aAndRuntime(unittest.TestCase):
             event["http"]["gatewayRequest"]["headers"].pop("Mcp-Session-Id")
             out, _ = h.run(event)
             self.assertEqual(out["http"]["transformedGatewayRequest"]["body"],
-                             event["http"]["gatewayRequest"]["body"])   # the caller's own bytes
+                             event["http"]["gatewayRequest"]["body"])
             body = h.body
+            self.assertEqual(h.root_body["content"], "Which projects are at risk?")
             self.assertEqual(body["action"], {"name": "invokeAgent"})
             self.assertEqual(body["resource"]["type"], "Agent")
             self.assertEqual(body["resource"]["id"], "agent-a")
             self.assertEqual(body["subject"], {"type": "User", "id": "u1"})
             self.assertEqual(body["transmission"]["role"], "user")
-            self.assertEqual(body["transmission"]["userQuery"], "Which projects are at risk?")
-            self.assertEqual(body["session"]["id"], "ctx-7")             # the A2A contextId
+            self.assertEqual(body["transmission"]["content"], "Which projects are at risk?")
+            self.assertEqual(h.server.header("X-Reva-Thread-Id"), "ctx-7")
+            self.assertEqual(body["session"], {"id": "ctx-7"})
 
-    def test_a2a_metadata_reaches_the_context_only_through_the_map(self):
+    def test_a2a_metadata_reaches_the_context_by_name_and_through_the_map(self):
         with Harness(REVA_CONTEXT_MAP='{"countries": "Org_req_countries", "years": "Org_req_years"}'
                      ) as h:
             event = http_event("/agent-a/invocations", a2a_payload(), headers=headers())
@@ -343,9 +322,21 @@ class A2aAndRuntime(unittest.TestCase):
             event = http_event("/agent-a/invocations", payload, headers=headers())
             h.run(event)
             context = h.body["context"]
-            self.assertEqual(context["Org_req_countries"], ["ES", "PT"])
-            self.assertNotIn("Org_req_years", context)          # an empty set is dropped
-            self.assertNotIn("traceNote", json.dumps(h.body))   # unmapped keys never leave
+            self.assertEqual(context["Org_req_countries"], ["ES", "PT"])   # renamed by the map
+            self.assertEqual(context["countries"], ["ES", "PT"])           # and under its own name
+            self.assertEqual(context["traceNote"], "stays here")
+            self.assertNotIn("Org_req_years", context)                     # an empty set
+            self.assertNotIn("years", context)
+
+    def test_the_body_context_can_be_turned_off_and_the_map_still_works(self):
+        with Harness(REVA_CONTEXT_FROM_BODY="false",
+                     REVA_CONTEXT_MAP='{"countries": "Org_req_countries"}') as h:
+            payload = a2a_payload()
+            payload["params"]["message"]["metadata"] = {
+                "countries": ["ES"], "traceNote": "stays here"}
+            h.run(http_event("/agent-a/invocations", payload, headers=headers()))
+            self.assertEqual(h.body["context"], {"Org_req_countries": ["ES"]})
+            self.assertNotIn("traceNote", json.dumps(h.body))
 
     def test_an_a2a_deny_is_a_jsonrpc_error_with_the_request_id_base64_encoded(self):
         with Harness() as h:
@@ -366,21 +357,20 @@ class A2aAndRuntime(unittest.TestCase):
             self.assertEqual(payload["error"]["type"], "permission_denied")
             self.assertEqual(payload["error"]["code"], "policy_denied")
 
-    def test_agent_to_agent_hop_after_the_entry_call_sees_the_entry_in_its_history(self):
+    def test_agent_to_agent_hop_uses_txn_token_not_agent_header(self):
         with Harness() as h:
+            h.server.default = {"status": 200, "body": {"decision": True, "token": "t1"}}
             h.run(http_event("/orchestrator/invocations", a2a_payload("question"),
                              headers=headers()))
             h.run(http_event("/analytics/invocations", a2a_payload("sub question"),
-                             headers={"traceparent": traceparent(),
-                                      "x-reva-agent-id": "orchestrator"}))
+                             headers={**headers(), "x-transaction-token": "t1"}))
             body = h.body
-            self.assertEqual(body["subject"], {"type": "Agent", "id": "orchestrator"})
-            self.assertEqual(body["transmission"]["role"], "assistant")
-            hop = body["context"]["hops"][0]
-            self.assertEqual((hop["subject"], hop["action"], hop["resource"]["id"]),
-                             ({"type": "User", "id": "u1"}, "invokeAgent", "orchestrator"))
-            self.assertEqual(body["context"]["conversation"]["messages"][0]["content"], "question")
-            self.assertEqual(body["context"]["conversation"]["messages"][0]["role"], "user")
+            self.assertNotIn("subject", body)
+            self.assertNotIn("principal", body)
+            # Nested hop with txn token uses role=agent (speaker is the agent).
+            self.assertEqual(body["transmission"]["role"], "agent")
+            self.assertNotIn("context", body)
+            self.assertEqual(h.server.header("X-Transaction-Token"), "t1")
 
 
 class PassThroughAndLocalDenies(unittest.TestCase):
@@ -388,11 +378,24 @@ class PassThroughAndLocalDenies(unittest.TestCase):
         with Harness() as h:
             for event in (mcp_event(method="tools/list"), mcp_event(method="initialize"),
                           mcp_event(http_method="GET", body=None),
-                          http_event("/health", {"x": 1}),
-                          http_event("/inference/v1/chat/completions",
-                                     {"model": "m", "messages": []})):
+                          http_event("/health", {"x": 1})):
                 self.assertTrue(passed(h.run(event)[0]), event)
             self.assertEqual(h.server.requests, [])
+
+    def test_inference_chat_completions_is_evaluated_as_invoke_model(self):
+        with Harness() as h:
+            event = http_event(
+                "/inference/v1/chat/completions",
+                {"model": "gpt-4o",
+                 "messages": [{"role": "user", "content": "say hi"}]},
+                headers=headers())
+            out, _ = h.run(event)
+            self.assertTrue(passed(out))
+            self.assertEqual(h.body["action"]["name"], "invokeModel")
+            self.assertEqual(h.body["resource"],
+                             {"type": "Model", "id": "gpt-4o", "name": "gpt-4o"})
+            self.assertEqual(h.root_body.get("userQuery") or h.root_body.get("content"),
+                             "say hi")
 
     def test_a_bodiless_passthrough_echoes_an_empty_object_not_null(self):
         with Harness() as h:
@@ -415,7 +418,7 @@ class PassThroughAndLocalDenies(unittest.TestCase):
 
     def test_a_response_leg_is_returned_untouched_even_with_a_broken_config(self):
         with Harness() as h:
-            h.cfg = settings(REVA_AUTH_MODE="nonsense")      # config error
+            h.cfg = settings(REVA_AUTH_MODE="nonsense")
             response = {"statusCode": 200, "body": {"jsonrpc": "2.0", "id": 1,
                                                     "result": {"content": []}}}
             out, _ = h.run(mcp_event(response=response))
@@ -440,16 +443,16 @@ class PassThroughAndLocalDenies(unittest.TestCase):
                 self.assertIn("transformedGatewayResponse", json.dumps(out))
 
 
-class TraceAndHistoryModes(unittest.TestCase):
-    def test_no_traceparent_mints_a_trace_with_no_history(self):
+class Trace(unittest.TestCase):
+    def test_no_traceparent_mints_a_trace(self):
         with Harness() as h:
             event = mcp_event("srv___t", {"q": 1}, headers={"Authorization": bearer(),
                                                             "Mcp-Session-Id": "chat-1"})
             out, logs = h.run(event)
             self.assertTrue(passed(out))
             self.assertEqual(h.log(logs)["traceSource"], "minted")
-            self.assertEqual(h.store.traces, {})                  # nothing written
             self.assertTrue(h.server.header("traceparent"))
+            self.assertEqual(h.body["session"], {"id": "chat-1"})
 
     def test_no_traceparent_can_be_denied(self):
         with Harness(REVA_ON_MISSING_TRACEPARENT="deny") as h:
@@ -463,37 +466,6 @@ class TraceAndHistoryModes(unittest.TestCase):
             _, logs = h.run(event)
             self.assertEqual((h.log(logs)["trace"], h.log(logs)["traceSource"]),
                              ("d" * 32, "header"))
-
-    def test_rtg_history_mode_sends_no_history_touches_no_table_and_needs_the_jwt_every_hop(self):
-        with Harness(REVA_HISTORY="rtg", REVA_HISTORY_TABLE="") as h:
-            self.assertEqual(h.cfg.errors, ())
-            h.run(tool_event("srv___first"))
-            self.assertNotIn("session", h.body)
-            self.assertNotIn("context", h.body)
-            self.assertEqual(h.server.header("X-Reva-Thread-Id"), "chat-1")
-            self.assertEqual(h.store.traces, {})
-            later = mcp_event("srv___second", {}, headers={"traceparent": traceparent()})
-            self.assertEqual(deny_code(h.run(later)[0]), "missing_authorization")
-
-    def test_an_unreadable_table_fails_closed_or_open(self):
-        with Harness() as h:
-            broken = mock.Mock(side_effect=StoreError("throttled"))
-            h.store.get_trace = broken
-            out, logs = h.run(tool_event())
-            self.assertEqual(deny_code(out), "history_unavailable")
-            self.assertEqual(h.server.requests, [])
-        with Harness(REVA_FAIL_OPEN="true") as h:
-            h.store.get_trace = mock.Mock(side_effect=StoreError("throttled"))
-            out, _ = h.run(tool_event())
-            self.assertTrue(passed(out))
-            self.assertEqual(h.body["principal"]["id"], "u1")     # from the JWT, no history
-
-    def test_a_failed_hop_write_does_not_fail_a_call_that_passed_policy(self):
-        with Harness() as h:
-            h.store.append_hop = mock.Mock(side_effect=StoreError("AccessDenied"))
-            out, logs = h.run(tool_event())
-            self.assertTrue(passed(out))
-            self.assertEqual(h.log(logs, "error")["code"], "hop_write_failed")
 
 
 class Secrecy(unittest.TestCase):
@@ -510,7 +482,7 @@ class Secrecy(unittest.TestCase):
                 self.assertNotIn(jwt, text)
                 self.assertNotIn("Bearer", text)
             shape = h.log(logs, "debug_event")
-            self.assertIn("authorization", shape["headers"])      # the NAME, never the value
+            self.assertIn("authorization", shape["headers"])
 
 
 class RtgCredential(unittest.TestCase):
@@ -522,10 +494,10 @@ class RtgCredential(unittest.TestCase):
             with mock.patch("interceptor.secret.get_token", return_value="from-the-secret"):
                 out, _ = h.run(tool_event())
             self.assertTrue(passed(out))
-            self.assertEqual(h.server.header("X-API-Token"), "from-the-secret")
+            self.assertEqual(h.server.header("X-API-Token"), "Bearer from-the-secret")
 
-    def test_an_unreadable_secret_denies_before_the_rtg_or_the_table_are_touched(self):
-        for env in ({}, {"REVA_FAIL_OPEN": "true"}):          # a missing credential never fails open
+    def test_an_unreadable_secret_denies_before_the_rtg_is_touched(self):
+        for env in ({}, {"REVA_FAIL_OPEN": "true"}):
             with self.subTest(env=env), Harness(**env) as h:
                 h.cfg = dataclasses.replace(h.cfg, token="")
                 failure = SecretError("cannot read secret 'reva/secrets': AccessDenied")
@@ -533,7 +505,6 @@ class RtgCredential(unittest.TestCase):
                     out, logs = h.run(tool_event())
                 self.assertEqual(deny_code(out), "token_unavailable")
                 self.assertEqual(h.server.requests, [])
-                self.assertEqual(h.store.traces, {})
                 self.assertIn("cannot read secret", h.log(logs, "local_deny")["reason"])
 
     def test_calls_that_are_not_evaluated_never_read_the_secret(self):
@@ -575,7 +546,7 @@ class LambdaHandler(unittest.TestCase):
 
     def test_settings_are_built_once_per_container(self):
         self.handler._SETTINGS = None
-        with mock.patch.dict("os.environ", {"REVA_HISTORY_TABLE": "x"}):
+        with mock.patch.dict("os.environ", {"REVA_BASE_URL": "https://example.test"}):
             first = self.handler._settings()
             self.assertIs(first, self.handler._settings())
 

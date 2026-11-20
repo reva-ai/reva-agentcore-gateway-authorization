@@ -1,8 +1,13 @@
 """The pipeline: event in, gateway response out. Nothing here raises past `handle`.
 
-    parse -> (response leg? pass) -> config check -> classify -> trace
-          -> trace record (principal, thread, turn, hops) -> subject
-          -> ask the RTG -> enforce -> record the hop (only if permitted) -> respond
+    parse -> (response leg? finalize+pass) -> config check -> classify -> trace
+          -> principal / thread from the call -> subject
+          -> ask the RTG -> enforce -> respond
+
+Hop history lives in the RTG (Postgres trace_hop). This Lambda sends
+`traceparent` and, on the first call of a trace, the thread id and `session.id`. It does not
+send `context.hops` or prior `session.messages`. On RESPONSE for the UI chat turn it POSTs
+`/trace/summarize` so the RTG can attach `session.messages` on later turns.
 
 Failure policy, in one place:
 
@@ -11,34 +16,32 @@ Failure policy, in one place:
     RTG policy deny  403, a false `decision`, USER_NOT_FOUND/DISABLED  deny
                                                     (monitor mode logs it and passes)
     RTG invalid      any other 4xx: our request is wrong                always deny
-    dependency down  RTG 401/404/413/424/429/5xx, timeout, or the history table
-                     unreadable                          deny, or pass if REVA_FAIL_OPEN
+    dependency down  RTG 401/404/413/424/429/5xx, timeout
+                                                     deny, or pass if REVA_FAIL_OPEN
 """
 
 from __future__ import annotations
 
 import json
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from . import respond
 from .classify import Call, Reject, Skip, classify
 from .config import Settings
 from .event import Envelope, EventError, parse_event
-from .history import StoreError, open_store, paired_history
-from .identity import resolve_agent, resolve_principal, subject_for
+from .finalize import from_envelope as finalize_hint
+from .identity import bearer_token, resolve_principal
 from .rtg import (ALLOW, CONDITIONAL, POLICY_DENY, REJECTED, Decision, build_request,
-                  evaluate, request_headers)
+                  context_for, evaluate, request_headers, summarize)
 from .secret import SecretError, with_token
 from .trace import resolve_thread, resolve_trace, span_id
-from .util import canonical_json, clip_utf8, iso_now, sha256_hex
-
-_STORES: Dict[Any, Any] = {}
+from .util import canonical_json, sha256_hex
 
 PRINCIPAL_REASONS = {
-    "missing_authorization": "no bearer token: attach the interceptor with "
-                             "passRequestHeaders=true and send the user's JWT on the "
-                             "first call of each trace",
+    "missing_authorization": "no bearer token and no X-Transaction-Token: attach "
+                             "the interceptor with passRequestHeaders=true and "
+                             "send the user's JWT (and txn token on nested hops)",
     "invalid_authorization": "the Authorization bearer token is not a decodable JWT",
     "principal_unresolved": "the configured user claim is missing from the token",
 }
@@ -46,16 +49,6 @@ PRINCIPAL_REASONS = {
 
 def _log(**fields: Any) -> None:
     print(json.dumps(fields, default=str, separators=(",", ":")))
-
-
-def get_store(cfg: Settings) -> Any:
-    key = (cfg.history_table, cfg.history_pk_attr, cfg.history_sk_attr)
-    if key not in _STORES:
-        try:
-            _STORES[key] = open_store(cfg)
-        except Exception as exc:  # noqa: BLE001
-            raise StoreError(f"cannot open table {cfg.history_table!r}: {exc}") from exc
-    return _STORES[key]
 
 
 def _remaining_ms(context: Any) -> Optional[int]:
@@ -84,7 +77,7 @@ def _seed(env: Envelope) -> str:
     return "|".join((env.request_id, env.path, body, env.headers.get("authorization", "")))
 
 
-def handle(event: Any, context: Any, cfg: Settings, store: Any = None) -> Dict[str, Any]:
+def handle(event: Any, context: Any, cfg: Settings) -> Dict[str, Any]:
     started = time.monotonic()
     try:
         env = parse_event(event, context)
@@ -94,9 +87,7 @@ def handle(event: Any, context: Any, cfg: Settings, store: Any = None) -> Dict[s
                                       cfg.deny_status)
 
     if env.leg == "response":
-        # REQUEST-only in v1. If the customer attached both interception points, the
-        # response is returned exactly as it came.
-        return respond.pass_response(env)
+        return _handle_response(env, cfg)
 
     if cfg.debug:
         _log(event="debug_event", **_shape(env))
@@ -128,122 +119,134 @@ def handle(event: Any, context: Any, cfg: Settings, store: Any = None) -> Dict[s
              reason="no traceparent: this call is its own trace and has no history")
     span = span_id(trace_id, call.span_key)
 
-    # ── who, which chat, and the hops so far: from the table when it knows this trace
-    use_store = cfg.history == "interceptor" and trace_source != "minted"
-    if use_store and store is None:
-        try:
-            store = get_store(cfg)
-        except StoreError as exc:
-            if not cfg.fail_open:
-                return _local_deny(env, cfg, "history_unavailable", str(exc))
-            _log(event="warn", code="history_unavailable", reason=str(exc))
-            use_store = False
-
-    record: Optional[Dict[str, Any]] = None
-    if use_store:
-        try:
-            record = store.get_trace(trace_id)
-        except StoreError as exc:
-            if not cfg.fail_open:
-                return _local_deny(env, cfg, "history_unavailable", str(exc))
-            _log(event="warn", code="history_unavailable", reason=str(exc))
-            use_store = False
-
-    stored_hops: List[Dict[str, Any]] = []
-    thread_source = "stored"
-    first_call = not (record and record["principal"])
-    if not first_call:
-        principal, groups = record["principal"], record["groups"]
-        thread_id, turn, started_at = record["thread_id"], record["turn"], record["started_at"]
-        stored_hops = record["hops"]
+    # ── who is acting (token-enrich: user JWT + txn token) ──────────────────
+    # Entry (UI chat): User from the JWT. Nested hops: carry Authorization and
+    # X-Transaction-Token; RTG derives Agent + principal from the txn token
+    # (body omits subject/principal). AgentCore Runtime often never surfaces
+    # Authorization on /invocations, so a nested hop may carry only the txn —
+    # that is still valid.
+    txn_token = (env.headers.get("x-transaction-token")
+                 or env.headers.get("x-reva-token") or "").strip()
+    if txn_token[:7].lower() == "bearer ":
+        txn_token = txn_token[7:].strip()
+    principal, groups, code = resolve_principal(env.headers, cfg)
+    if code == "missing_authorization" and txn_token:
+        principal, groups, code = "", [], ""
+        _log(event="warn", code="nested_txn_no_jwt",
+             reason="no Authorization on nested hop; evaluating from X-Transaction-Token only")
+    if code:
+        return _local_deny(env, cfg, code, PRINCIPAL_REASONS[code])
+    # The thread is recorded on the first call of a turn only. A later hop carries the prior
+    # transaction token and the RTG joins it to the thread through the trace, so sending a
+    # thread id again could only split the thread if a hop carried a different one.
+    if txn_token:
+        thread_id, thread_source = "", "nested_hop"
     else:
-        # The trace's first call: the user's token and a thread id are read once, here.
-        principal, groups, code = resolve_principal(env.headers, cfg)
-        if code:
-            return _local_deny(env, cfg, code, PRINCIPAL_REASONS[code])
         thread_id, thread_source = resolve_thread(env.headers, call.thread_hint, trace_id)
         if thread_source == "trace":
             _log(event="warn", code="thread_missing",
                  reason="no thread id: this prompt is its own chat")
-        turn, started_at = 1, iso_now()
-        stored_hops = record["hops"] if record else []
-        if use_store:
-            try:
-                turn, chat_started = store.claim_turn(thread_id, trace_id)
-                established = store.establish(trace_id, principal, groups, thread_id,
-                                              turn, chat_started)
-                # The first writer wins a race, so adopt what is stored. The hops are the
-                # ones read above: a hop another call writes in between is not yet history.
-                principal, groups = established["principal"], established["groups"]
-                thread_id, turn = established["thread_id"], established["turn"]
-                started_at = established["started_at"]
-            except StoreError as exc:
-                if not cfg.fail_open:
-                    return _local_deny(env, cfg, "history_unavailable", str(exc))
-                _log(event="warn", code="history_unavailable", reason=str(exc))
-                use_store = False
 
-    # ── who is acting ───────────────────────────────────────────────────────
-    agent_id, agent_source = resolve_agent(env.headers, cfg)
-    subject = subject_for(principal, agent_id)
-    role = "user" if subject["type"] == "User" and call.action == "invokeAgent" else "assistant"
+    subject = {"type": "User", "id": principal} if principal else {"type": "User", "id": "derived"}
+    # The speaker the RTG records. Earlier user requests are recalled from hops with
+    # role=user, so the first call of a turn (the end user's utterance) is always "user";
+    # a later hop, which carries the prior transaction token, is the agent.
+    role = (call.role or "agent") if txn_token else "user"
+    subject_source = "transaction_token" if txn_token else "user"
+    user_bearer = bearer_token(env.headers)
 
-    hops: List[Dict[str, Any]] = []
-    messages: List[Dict[str, Any]] = []
-    if cfg.history == "interceptor":
-        hops, messages = paired_history(stored_hops, span, cfg.max_hops_sent)
-
-    # ── ask the RTG ─────────────────────────────────────────────────────────
-    body = build_request(cfg, call, principal, subject, role, thread_id, turn, started_at,
-                         hops, messages, groups)
+    # ── ask the RTG (rtg/a2a token-evaluation body) ─────────────────────────
+    pairs, left_out = context_for(cfg, call)
+    body = build_request(cfg, call, principal, subject, role, groups,
+                         thread_id=thread_id, omit_subject=bool(txn_token), context=pairs)
     if cfg.debug:
         _log(event="debug_request", body=body)
-    decision = evaluate(cfg, body, request_headers(cfg, trace_id, span, thread_id),
-                        _remaining_ms(context))
+        if left_out:        # names and reasons only, never values
+            _log(event="debug_context_left_out", pairs=left_out)
+    headers = request_headers(cfg, trace_id, span, thread_id,
+                              user_bearer=user_bearer, txn_token=txn_token)
+    decision = evaluate(cfg, body, headers, _remaining_ms(context))
+    if decision.status == 400 and pairs:
+        # The RTG turns a whole request away when one context pair is outside what it reads.
+        # The pairs are filtered first, but if its rules move ahead of the filter, decide the
+        # call without them rather than lose the decision.
+        _log(event="warn", code="context_refused",
+             reason="the RTG refused the request with context: evaluating again without it")
+        body["rtg/a2a"].pop("context", None)
+        decision = evaluate(cfg, body, headers, _remaining_ms(context))
 
-    permitted, record_hop, verdict, code = _enforce(cfg, decision)
-
-    if permitted and record_hop and use_store:
-        hop = {"span": span, "subject": subject, "action": call.action,
-               "resource": {"type": call.resource["type"], "id": call.resource["id"]},
-               "time": iso_now(), "role": role,
-               "content": clip_utf8(call.prompt, cfg.content_max_bytes)}
-        try:
-            store.append_hop(trace_id, hop)
-        except StoreError as exc:
-            # The call already passed policy: say so loudly, do not fail it.
-            _log(event="error", code="hop_write_failed", reason=str(exc))
+    permitted, verdict, code = _enforce(cfg, decision)
 
     _log(event="decision", decision=verdict, outcome=decision.outcome, status=decision.status,
          errorType=decision.error_type, reason=decision.reason, attempts=decision.attempts,
          rtgMs=decision.latency_ms, totalMs=int((time.monotonic() - started) * 1000),
          trace=trace_id, traceSource=trace_source, thread=thread_id, threadSource=thread_source,
-         turn=turn, firstCall=first_call, action=call.action, resource=call.resource["id"],
-         subjectType=subject["type"], subjectSource=agent_source,
-         principalHash=sha256_hex(principal)[:12], hopsSent=len(hops),
+         action=call.action, resource=call.resource["id"],
+         subjectType=("derived" if txn_token else "User"), subjectSource=subject_source,
+         principalHash=sha256_hex(principal)[:12],
          route=f"{env.transport}:{env.path}")
 
     if permitted:
-        return respond.pass_request(env)
+        out = respond.pass_request(env, txn_token=decision.token or None)
+        transform = (out.get("http") or out.get("mcp") or {})
+        req = transform.get("transformedGatewayRequest") or {}
+        hdrs = req.get("headers") or {}
+        # Never log token values — only the shape the gateway will validate.
+        _log(event="pass_request",
+             keys=sorted(transform.keys()),
+             hasBody=bool(req.get("body")),
+             bodyBytes=len(req.get("body") or ""),
+             headerNames=sorted(hdrs.keys()),
+             hasTxn=bool(decision.token),
+             txnInjected=bool(hdrs),
+             outputKeys=sorted(out.keys()))
+        return out
     return respond.deny(env, cfg.deny_message, code, cfg.deny_status)
 
 
 def _enforce(cfg: Settings, decision: Decision):
-    """(permitted, record the hop, verdict for the log, deny code)."""
+    """(permitted, verdict for the log, deny code)."""
     outcome = decision.outcome
     if outcome == ALLOW:
-        return True, True, "permit", ""
+        return True, "permit", ""
     if outcome == CONDITIONAL:
         if cfg.conditional_allow == "allow":
-            return True, True, "permit_conditional", ""
-        return False, False, "deny", "policy_denied"
+            return True, "permit_conditional", ""
+        return False, "deny", "policy_denied"
     if outcome == POLICY_DENY:
         if cfg.monitor_mode:
-            # The call ran, so it is part of the path later hops are judged against.
-            return True, True, "monitor_would_deny", ""
-        return False, False, "deny", "policy_denied"
+            return True, "monitor_would_deny", ""
+        return False, "deny", "policy_denied"
     if outcome == REJECTED:
-        return False, False, "deny", "rtg_rejected"
+        return False, "deny", "rtg_rejected"
     if cfg.fail_open:      # OPERATIONAL: a dependency, not a decision
-        return True, False, "permit_fail_open", ""
-    return False, False, "deny", "rtg_unavailable"
+        return True, "permit_fail_open", ""
+    return False, "deny", "rtg_unavailable"
+
+
+def _handle_response(env: Envelope, cfg: Settings) -> Dict[str, Any]:
+    """Pass the response through; at end of the UI chat turn, best-effort POST
+    /trace/summarize so RTG can populate session.messages on later turns.
+    """
+    try:
+        hint = finalize_hint(env)
+        summarize_status = 0
+        if hint.should_summarize and hint.trace_id:
+            try:
+                cfg = with_token(cfg)
+                summarize_status = summarize(
+                    cfg, hint.trace_id, hint.thread_id, hint.output)
+            except SecretError as exc:
+                _log(event="summarize_skip", reason=str(exc)[:200])
+        # Shape only — never headers, bodies, tokens, or prompt/output text.
+        _log(event="response_leg",
+             transport=env.transport,
+             path=env.path,
+             shouldSummarize=hint.should_summarize,
+             summarizeStatus=summarize_status,
+             hasTrace=bool(hint.trace_id),
+             hasThread=bool(hint.thread_id),
+             outputBytes=len(hint.output or ""))
+    except Exception as exc:  # noqa: BLE001 - never fail the caller on finalize parse
+        _log(event="response_leg", error=type(exc).__name__, detail=str(exc)[:200])
+    return respond.pass_response(env)
