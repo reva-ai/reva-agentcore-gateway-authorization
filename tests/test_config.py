@@ -4,32 +4,7 @@ from interceptor.config import Settings
 
 
 def build(**env):
-    base = {"REVA_HISTORY_TABLE": "table"}
-    base.update(env)
-    return Settings.from_env(base)
-
-
-class History(unittest.TestCase):
-    def test_defaults_are_a_partition_key_and_a_sort_key(self):
-        cfg = build()
-        self.assertEqual((cfg.history_pk_attr, cfg.history_sk_attr), ("pk", "sk"))
-        self.assertEqual(cfg.errors, ())
-
-    def test_key_attribute_names_are_configurable(self):
-        cfg = build(REVA_HISTORY_PK_ATTR="trace", REVA_HISTORY_SK_ATTR="part")
-        self.assertEqual((cfg.history_pk_attr, cfg.history_sk_attr), ("trace", "part"))
-
-    def test_the_old_single_key_setting_is_reported_not_silently_ignored(self):
-        cfg = build(REVA_HISTORY_KEY_ATTR="session_id")
-        self.assertEqual(len(cfg.errors), 1)
-        self.assertIn("REVA_HISTORY_KEY_ATTR is no longer used", cfg.errors[0])
-        self.assertIn("sort key", cfg.errors[0])
-
-    def test_the_table_is_reva_trace_hop_unless_named(self):
-        bare = Settings.from_env({})
-        self.assertEqual((bare.history_table, bare.errors), ("reva_trace_hop", ()))
-        self.assertEqual(build(REVA_HISTORY_TABLE="").history_table, "reva_trace_hop")
-        self.assertEqual(build(REVA_HISTORY_TABLE="mine").history_table, "mine")
+    return Settings.from_env(env)
 
 
 class TokenSecret(unittest.TestCase):
@@ -62,12 +37,12 @@ class TolerantParsing(unittest.TestCase):
 
     def test_the_host_is_api_reva_ai_unless_named(self):
         bare = Settings.from_env({})
-        self.assertEqual(bare.evaluate_url, "https://api.reva.ai/pdp/v2/ai/evaluation")
+        self.assertEqual(bare.evaluate_url, "https://api.reva.ai/pdp/ai/access/ai/evaluation")
         self.assertEqual(build(REVA_BASE_URL="  ").base_url, "https://api.reva.ai")
 
     def test_base_url_forms(self):
         self.assertEqual(build(REVA_BASE_URL="api.reva.ai").evaluate_url,
-                         "https://api.reva.ai/pdp/v2/ai/evaluation")
+                         "https://api.reva.ai/pdp/ai/access/ai/evaluation")
         self.assertEqual(build(REVA_BASE_URL="https://x.example/").base_url, "https://x.example")
         self.assertEqual(build(REVA_BASE_URL="localhost:8080").base_url, "http://localhost:8080")
 
@@ -75,6 +50,12 @@ class TolerantParsing(unittest.TestCase):
         self.assertTrue(build(REVA_TARGETS='{"a": {"kind": "agent"}}').errors)
         self.assertTrue(build(REVA_TARGETS='{"a": {"colour": "red"}}').errors)
         self.assertEqual(build(REVA_TARGETS='{"a": {"id": "b", "kind": "skip"}}').errors, ())
+
+
+class BodyContext(unittest.TestCase):
+    def test_pairs_from_the_request_body_are_sent_unless_turned_off(self):
+        self.assertTrue(build().context_from_body)
+        self.assertFalse(build(REVA_CONTEXT_FROM_BODY="false").context_from_body)
 
 
 if __name__ == "__main__":

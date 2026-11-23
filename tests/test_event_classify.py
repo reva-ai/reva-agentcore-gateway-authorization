@@ -83,9 +83,11 @@ class McpClassification(unittest.TestCase):
     def test_tool_parents_and_endpoint_are_opt_in(self):
         plain = self.classify(mcp_event("srv___t"))
         self.assertNotIn("parents", plain.resource)
+        self.assertNotIn("endpoint", plain.resource)
         rich = self.classify(mcp_event("srv___t"), REVA_TOOL_PARENTS="true",
                              REVA_TARGETS='{"srv": {"endpoint": "https://mcp.example/x"}}')
         self.assertEqual(rich.resource["parents"], [{"type": "MCPServer", "id": "srv"}])
+        self.assertEqual(rich.resource["endpoint"], "https://mcp.example/x")
         self.assertEqual(rich.resource["properties"]["endpoint"],
                          {"url": "https://mcp.example/x", "type": "MCP"})
 
@@ -187,6 +189,14 @@ class HttpClassification(unittest.TestCase):
         self.assertEqual((call.action, call.resource["id"], call.prompt),
                          ("invokeAgent", "my-agent", "hi there"))
 
+    def test_agentcore_input_prompt_is_unwrapped(self):
+        call = self.classify(http_event(
+            "/target-billing-agent/invocations",
+            {"input": {"prompt": "Open a ticket for customer c1 about a billing discrepancy"}},
+        ))
+        self.assertEqual(call.prompt,
+                         "Open a ticket for customer c1 about a billing discrepancy")
+
     def test_plain_runtime_prompt_fallbacks(self):
         self.assertEqual(self.classify(http_event("/x/invocations", {"unknown": 1})).prompt,
                          '{"unknown":1}')
@@ -201,22 +211,34 @@ class HttpClassification(unittest.TestCase):
         call = self.classify(http_event("/my-agent/invocations", {"prompt": "x"}),
                              REVA_TARGETS=targets)
         self.assertEqual(call.resource["id"], "agent-entity")
+        self.assertEqual(call.resource["endpoint"], "https://rt.example/a")
         self.assertEqual(call.resource["properties"]["endpoint"],
                          {"url": "https://rt.example/a", "type": "Agent"})
         self.assertIsInstance(
             self.classify(http_event("/internal/invocations", {"prompt": "x"}),
                           REVA_TARGETS=targets), Skip)
 
-    def test_inference_and_unknown_http_are_unclassified(self):
-        chat = http_event("/inference/v1/chat/completions",
-                          {"model": "m", "messages": [{"role": "user", "content": "hi"}]})
-        invoke = http_event("/model/anthropic.x/invoke", {"messages": []})
-        shaped = http_event("/v1/anything", {"model": "m", "input": "hi"})
+    def test_inference_is_invoke_model(self):
+        call = self.classify(http_event(
+            "/inference/v1/chat/completions",
+            {"model": "gpt-4o",
+             "messages": [{"role": "user", "content": "hi there"}]}))
+        self.assertEqual((call.kind, call.action, call.resource["type"],
+                          call.resource["id"], call.prompt, call.role),
+                         ("model", "invokeModel", "Model", "gpt-4o", "hi there", "agent"))
+
+    def test_openai_shaped_body_without_inference_path(self):
+        call = self.classify(http_event(
+            "/v1/chat/completions",
+            {"model": "gpt-4o", "messages": [{"role": "user", "content": "ping"}]}))
+        self.assertEqual(call.action, "invokeModel")
+        self.assertEqual(call.prompt, "ping")
+
+    def test_unknown_http_is_unclassified(self):
         other = http_event("/health", {"x": 1})
-        for event in (chat, invoke, shaped, other):
-            self.assertIsInstance(self.classify(event), Skip)
-            denied = self.classify(event, REVA_UNCLASSIFIED="deny")
-            self.assertEqual(denied.code, "unclassified_traffic")
+        self.assertIsInstance(self.classify(other), Skip)
+        denied = self.classify(other, REVA_UNCLASSIFIED="deny")
+        self.assertEqual(denied.code, "unclassified_traffic")
 
     def test_a_runtime_path_wins_over_an_inference_looking_body(self):
         call = self.classify(http_event("/my-agent/invocations",
@@ -233,6 +255,62 @@ class HttpClassification(unittest.TestCase):
         self.assertEqual(classify(env, settings()).span_key, "req-123")
         no_id = classify(parse_event(event), settings()).span_key
         self.assertIn("/a/invocations", no_id)
+
+
+class A2aSendMessage(unittest.TestCase):
+    def classify(self, event, **env):
+        return classify(parse_event(event), settings(**env))
+
+    def test_data_parts_are_part_of_the_prompt_as_json(self):
+        payload = a2a_payload()
+        payload["params"]["message"]["parts"] = [
+            {"text": "approve"}, {"kind": "data", "data": {"b": 2, "a": 1}}]
+        call = self.classify(http_event("/a/invocations", payload))
+        self.assertEqual(call.prompt, 'approve\n{"a":1,"b":2}')
+
+    def test_a_message_of_data_parts_alone_still_has_a_prompt(self):
+        payload = a2a_payload()
+        payload["params"]["message"]["parts"] = [{"data": {"amount": 250}}]
+        self.assertEqual(self.classify(http_event("/a/invocations", payload)).prompt,
+                         '{"amount":250}')
+
+    def test_a_large_data_part_is_clipped(self):
+        payload = a2a_payload()
+        payload["params"]["message"]["parts"] = [{"data": {"blob": "x" * 20000}}]
+        call = self.classify(http_event("/a/invocations", payload),
+                             REVA_PROMPT_MAX_BYTES="100000")
+        self.assertEqual(len(call.prompt.encode("utf-8")), 8192)
+
+    def test_the_rest_binding_is_evaluated_like_json_rpc(self):
+        body = {"message": {"role": "ROLE_USER", "contextId": "ctx-r",
+                            "parts": [{"text": "rest hello"}]}}
+        for suffix in ("message:send", "message:stream"):
+            call = self.classify(http_event(f"/agent-a/{suffix}", body))
+            self.assertEqual((call.kind, call.action), ("agent", "invokeAgent"), suffix)
+            self.assertEqual(call.resource["id"], "agent-a")
+            self.assertEqual((call.prompt, call.thread_hint), ("rest hello", "ctx-r"))
+
+    def test_the_rest_binding_ignores_a_prefix_before_the_operation(self):
+        call = self.classify(http_event("/agent-a/v1/message:send",
+                                        {"message": {"parts": [{"text": "hi"}]}}))
+        self.assertEqual((call.resource["id"], call.prompt), ("agent-a", "hi"))
+
+    def test_the_rest_binding_with_no_agent_in_the_path_fails_closed(self):
+        body = {"message": {"parts": [{"text": "hi"}]}}
+        self.assertEqual(self.classify(http_event("/message:send", body)).code,
+                         "unresolvable_resource")
+        call = self.classify(http_event("/message:send", body), REVA_UNKNOWN_RESOURCE="unknown")
+        self.assertEqual(call.resource["id"], "unknown-agent")
+
+    def test_a_rest_request_without_a_message_still_has_a_prompt(self):
+        call = self.classify(http_event("/agent-a/message:send", {"metadata": {"k": "v"}}))
+        self.assertEqual(call.prompt, "invokeAgent agent-a")
+
+    def test_only_a_post_to_the_operation_is_the_rest_binding(self):
+        body = {"message": {"parts": [{"text": "hi"}]}}
+        self.assertIsInstance(
+            self.classify(http_event("/agent-a/message:send", body, http_method="GET")), Skip)
+        self.assertIsInstance(self.classify(http_event("/agent-a/tasks/t1", body)), Skip)
 
 
 if __name__ == "__main__":

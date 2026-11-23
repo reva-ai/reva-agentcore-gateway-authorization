@@ -31,20 +31,37 @@ OUTPUT_VERSION = "1.0"
 JSONRPC_DENY_CODE = -32003
 
 
-def pass_request(env: Envelope) -> Dict[str, Any]:
+def pass_request(env: Envelope, txn_token: Optional[str] = None) -> Dict[str, Any]:
+    """Pass the request through; on allow inject txn headers when minted.
+
+    Injects X-Transaction-Token / X-REVA-TOKEN (must be on the target's
+    allowedRequestHeaders). Does not inject Authorization.
+    """
+    inject: Dict[str, str] = {}
+    if txn_token:
+        inject["X-Transaction-Token"] = txn_token
+        inject["X-REVA-TOKEN"] = txn_token
+
     if env.transport == "http":
+        if not env.raw_body and not inject:
+            return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {}}
+        transform: Dict[str, Any] = {}
         if env.raw_body:
-            return {"interceptorOutputVersion": OUTPUT_VERSION,
-                    "http": {"transformedGatewayRequest": {"body": env.raw_body}}}
-        return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {}}
-    # `{}`, never null, for a request with no body (a GET that opens the event stream):
-    # that is what the live gateway was verified to accept.
+            transform["body"] = env.raw_body
+        if inject:
+            transform["headers"] = inject
+        return {"interceptorOutputVersion": OUTPUT_VERSION,
+                "http": {"transformedGatewayRequest": transform}}
+    body = env.body if env.body is not None else {}
+    transform_mcp: Dict[str, Any] = {"body": body}
+    if inject:
+        transform_mcp["headers"] = inject
     return {"interceptorOutputVersion": OUTPUT_VERSION,
-            "mcp": {"transformedGatewayRequest": {
-                "body": env.body if env.body is not None else {}}}}
+            "mcp": {"transformedGatewayRequest": transform_mcp}}
 
 
 def pass_response(env: Envelope) -> Dict[str, Any]:
+    # AWS docs: empty http object passes the Runtime response through unchanged.
     if env.transport == "http":
         return {"interceptorOutputVersion": OUTPUT_VERSION, "http": {}}
     response = env.response or {}

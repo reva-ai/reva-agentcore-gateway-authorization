@@ -1,7 +1,7 @@
 import unittest
 
 from interceptor.identity import (bearer_token, claim_list, claim_value, jwt_claims,
-                                  resolve_agent, resolve_principal, subject_for)
+                                  resolve_principal)
 from interceptor.trace import (parse_traceparent, resolve_thread, resolve_trace, span_id,
                                traceparent_header)
 
@@ -62,52 +62,6 @@ class Principal(unittest.TestCase):
                          "principal_unresolved")
 
 
-class Agent(unittest.TestCase):
-    def headers(self, claims=None, **extra):
-        headers = {"authorization": bearer(claims or {"sub": "u1"})}
-        headers.update(extra)
-        return headers
-
-    def test_switch_off_ignores_everything(self):
-        cfg = settings(REVA_AUTHORIZE_AGENT="false")
-        self.assertEqual(resolve_agent(self.headers(**{"x-reva-agent-id": "a"}), cfg),
-                         (None, "authorize_agent_off"))
-
-    def test_header_is_the_fallback(self):
-        cfg = settings()
-        self.assertEqual(resolve_agent(self.headers(**{"x-reva-agent-id": " agent-a "}), cfg),
-                         ("agent-a", "header:x-reva-agent-id"))
-
-    def test_token_claim_beats_the_header(self):
-        cfg = settings()
-        headers = self.headers({"sub": "u1", "act": {"sub": "from-token"}},
-                               **{"x-reva-agent-id": "from-header"})
-        self.assertEqual(resolve_agent(headers, cfg), ("from-token", "claim:act.sub"))
-
-    def test_client_id_is_opt_in(self):
-        headers = self.headers({"sub": "u1", "client_id": "ui-app"})
-        self.assertEqual(resolve_agent(headers, settings())[0], None)
-        cfg = settings(REVA_AGENT_CLAIMS="act.sub,client_id")
-        self.assertEqual(resolve_agent(headers, cfg), ("ui-app", "claim:client_id"))
-
-    def test_no_claims_configured_means_the_token_is_not_decoded(self):
-        cfg = settings(REVA_AGENT_CLAIMS="")
-        headers = self.headers({"sub": "u1", "act": {"sub": "ignored"}})
-        self.assertEqual(resolve_agent(headers, cfg), (None, "user_fallback"))
-
-    def test_custom_header_and_id_map(self):
-        cfg = settings(REVA_AGENT_HEADER="X-Caller-Agent",
-                       REVA_AGENT_ID_MAP='{"orchestrator": "acme-orchestrator"}')
-        self.assertEqual(resolve_agent(self.headers(**{"x-caller-agent": "orchestrator"}), cfg)[0],
-                         "acme-orchestrator")
-        self.assertEqual(resolve_agent(self.headers(**{"x-caller-agent": "other"}), cfg)[0], "other")
-
-    def test_unresolved_falls_back_to_the_user(self):
-        self.assertEqual(resolve_agent(self.headers(), settings()), (None, "user_fallback"))
-        self.assertEqual(subject_for("u1", None), {"type": "User", "id": "u1"})
-        self.assertEqual(subject_for("u1", "agent-a"), {"type": "Agent", "id": "agent-a"})
-
-
 class Trace(unittest.TestCase):
     def test_traceparent(self):
         self.assertEqual(parse_traceparent(traceparent()), TRACE)
@@ -146,8 +100,10 @@ class Trace(unittest.TestCase):
         self.assertEqual(traceparent_header(TRACE, "b" * 16), traceparent())
 
     def test_thread_precedence_and_fallback(self):
-        headers = {"x-reva-thread-id": "from-header", "mcp-session-id": "from-mcp"}
-        self.assertEqual(resolve_thread(headers, "ctx", TRACE), ("from-header", "header"))
+        headers = {"x-reva-session-id": "from-session", "mcp-session-id": "from-mcp"}
+        self.assertEqual(resolve_thread(headers, "ctx", TRACE), ("from-session", "header"))
+        legacy = {"x-reva-thread-id": "from-thread", "mcp-session-id": "from-mcp"}
+        self.assertEqual(resolve_thread(legacy, "ctx", TRACE), ("from-thread", "header"))
         self.assertEqual(resolve_thread({"mcp-session-id": "m"}, "ctx", TRACE),
                          ("ctx", "contextId"))
         self.assertEqual(resolve_thread({"mcp-session-id": "m"}, "", TRACE),

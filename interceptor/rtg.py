@@ -1,4 +1,9 @@
-"""The call to the RTG: `POST {base}/pdp/v2/ai/evaluation`.
+"""The call to the RTG: `POST {base}/pdp/ai/access/ai/evaluation`.
+
+Token-evaluation body: business prompt at the root, Reva fields under `rtg/a2a`.
+Headers request a transaction token on allow (`X-Reva-Token-Request: transaction`).
+Prior-hop tokens go as `X-Transaction-Token`; the caller's user JWT stays on
+`Authorization` when the gateway credential uses `X-API-Token`.
 
 The HTTP status is authoritative. 200 is an allow, 403 is a policy denial; the body
 is only read for a reason, an error type and an optional conditional-allow signal.
@@ -19,7 +24,8 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from .classify import Call
-from .config import Settings
+from .config import SUMMARIZE_OUTPUT_MAX, Settings
+from .context import build_context
 from .trace import traceparent_header
 
 ALLOW, CONDITIONAL, POLICY_DENY, REJECTED, OPERATIONAL = (
@@ -38,58 +44,89 @@ class Decision:
     reason: str = ""        # for the log only, never shown to the caller
     attempts: int = 0
     latency_ms: int = 0
+    token: str = ""         # minted transaction token on allow, when requested
 
 
-def build_request(cfg: Settings, call: Call, principal: str, subject: Dict[str, str],
-                  role: str, thread_id: str, turn: int, started_at: str,
-                  hops: List[Dict[str, Any]], messages: List[Dict[str, Any]],
-                  groups: List[str]) -> Dict[str, Any]:
-    body: Dict[str, Any] = {
-        "subject": subject,
-        "principal": {"type": "User", "id": principal},
-        "action": {"name": call.action},
-        "resource": call.resource,
-        "transmission": {"promptKey": cfg.prompt_key, cfg.prompt_key: call.prompt,
-                         "role": role, "contentType": "text/plain"},
-    }
+def context_for(cfg: Settings, call: Call) -> Tuple[Dict[str, Any], List[str]]:
+    """The call's `context` and what was left out of it (names and reasons, never values).
 
-    context: Dict[str, Any] = {}
-    if cfg.history == "interceptor":
-        # `hops` is always sent, empty on a trace's first call; `conversation` only
-        # when there is something in it. The RTG keeps caller-supplied history and
-        # does not replace it, which is why `rtg` mode sends neither.
-        context["hops"] = hops
-        if messages:
-            context["conversation"] = {"messages": messages}
-        body["session"] = {"id": thread_id, "turn": turn, "startedAt": started_at}
+    The pairs in the request body (unless REVA_CONTEXT_FROM_BODY=false) plus the arguments
+    REVA_CONTEXT_MAP renames to policy attributes, which win a repeated name.
+    """
+    pinned: Dict[str, Any] = {}
     for argument, attribute in cfg.context_map.items():
         value = call.arguments.get(argument)
         if value not in (None, "", [], {}):    # an empty set fails validation at the RTG
-            context[attribute] = value
+            pinned[attribute] = value
+    return build_context(call.context_sources if cfg.context_from_body else [], pinned)
+
+
+def build_request(cfg: Settings, call: Call, principal: str, subject: Dict[str, str],
+                  role: str, groups: List[str], *, thread_id: str = "",
+                  omit_subject: bool = False,
+                  context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Token-evaluation body: root prompt + `rtg/a2a` envelope.
+
+    Thread correlation uses `rtg/a2a.threadId` / `session.id` plus
+    `X-Reva-Thread-Id` on the wire. Do not send `context.hops` or prior
+    `session.messages` — the RTG attaches those from its store. When a prior
+    transaction token is present (`omit_subject`), body subject and principal
+    are omitted — RTG derives them from the token.
+    """
+    prompt_key = cfg.prompt_key
+    a2a: Dict[str, Any] = {
+        "action": {"name": call.action},
+        "resource": call.resource,
+        "transmission": {
+            "promptKey": prompt_key,
+            prompt_key: call.prompt,
+            "role": role,
+            "contentType": "text/plain",
+        },
+    }
+    if not omit_subject:
+        a2a["subject"] = subject
+        a2a["principal"] = {"type": "User", "id": principal}
+    if thread_id:
+        a2a["threadId"] = thread_id
+        a2a["session"] = {"id": thread_id}
+
+    if context is None:
+        context, _left_out = context_for(cfg, call)
     if context:
-        body["context"] = context
+        a2a["context"] = context
 
-    if groups:
-        body["entities"] = [{"uid": {"type": "User", "id": principal},
-                             "parents": [{"type": "UserGroup", "id": g} for g in groups]}]
-    return body
+    if groups and not omit_subject:
+        a2a["entities"] = [{"uid": {"type": "User", "id": principal},
+                            "parents": [{"type": "UserGroup", "id": g} for g in groups]}]
+
+    return {"rtg/a2a": a2a, prompt_key: call.prompt}
 
 
-def request_headers(cfg: Settings, trace_id: str, span: str, thread_id: str
+def request_headers(cfg: Settings, trace_id: str, span: str, thread_id: str,
+                    *, user_bearer: str = "", txn_token: str = ""
                     ) -> List[Tuple[str, str]]:
     headers = [
         ("Content-Type", "application/json"),
         ("traceparent", traceparent_header(trace_id, span)),
         ("x-ms-correlation-id", trace_id),
-        ("X-Reva-Thread-Id", thread_id),
+        ("X-Reva-Token-Request", "transaction"),
         ("User-Agent", USER_AGENT),
     ]
+    if thread_id:
+        headers.append(("X-Reva-Thread-Id", thread_id))
     if cfg.auth_mode == "bearer":
+        # Gateway credential occupies Authorization; user JWT is not dual-sent.
         headers.append(("Authorization", f"Bearer {cfg.token}"))
         if cfg.policy_store_id:
             headers.append(("policyStoreId", cfg.policy_store_id))
     else:
-        headers.append(("X-API-Token", cfg.token))
+        # The gateway credential carries the scheme, as the Kong plugin sends it.
+        headers.append(("X-API-Token", f"Bearer {cfg.token}"))
+        if user_bearer:
+            headers.append(("Authorization", f"Bearer {user_bearer}"))
+    if txn_token:
+        headers.append(("X-Transaction-Token", txn_token))
     if cfg.verify_user_scope:
         headers.append(("X-API-Origin-App", cfg.origin_app))
         headers.append(("X-Reva-Verification-Codes", "CODE_USER_SCOPE"))
@@ -136,22 +173,37 @@ def interpret(status: int, text: str) -> Decision:
     except ValueError:
         payload = None
     error_type = ""
-    if isinstance(payload, dict) and isinstance(payload.get("error_type"), str):
-        error_type = payload["error_type"]
+    minted = ""
+    if isinstance(payload, dict):
+        if isinstance(payload.get("error_type"), str):
+            error_type = payload["error_type"]
+        token = payload.get("token")
+        if isinstance(token, str) and token.strip():
+            minted = token.strip()
     reason = _reason(payload, text)
 
     if 200 <= status < 300:
         if not isinstance(payload, dict):
             return Decision(OPERATIONAL, status, error_type, f"unreadable {status} response")
-        if payload.get("decision") is False:
+        decision = payload.get("decision")
+        if decision is False:
             return Decision(POLICY_DENY, status, error_type, reason)
         guardrails = payload.get("guardrails")
         if isinstance(guardrails, dict) and guardrails.get("outcome") == "conditional_allow":
             return Decision(CONDITIONAL, status, error_type,
-                            str(guardrails.get("reason") or "conditional allow")[:300])
-        return Decision(ALLOW, status, error_type, reason)
+                            str(guardrails.get("reason") or "conditional allow")[:300],
+                            token=minted)
+        if decision is True:
+            return Decision(ALLOW, status, error_type, reason, token=minted)
+        # An allow says so. A 2xx that carries no `decision: true` is not one.
+        return Decision(POLICY_DENY, status, error_type,
+                        reason or "no allow decision in the response")
     if status == 403:
-        return Decision(POLICY_DENY, status, error_type, reason)
+        # A 403 is a policy decision only when the RTG says so. One without a `decision`
+        # or an `error_type` is an edge or proxy refusing the call, not a verdict.
+        if isinstance(payload, dict) and ("decision" in payload or error_type):
+            return Decision(POLICY_DENY, status, error_type, reason)
+        return Decision(OPERATIONAL, status, error_type, reason or "HTTP 403 without a decision")
     if status == 401 and error_type in USER_STATES:
         return Decision(POLICY_DENY, status, error_type, reason)
     if status in (401, 404, 408, 413, 424, 425, 429) or status >= 500:
@@ -204,3 +256,46 @@ def evaluate(cfg: Settings, body: Dict[str, Any], headers: List[Tuple[str, str]]
     last.attempts = made
     last.latency_ms = int((time.monotonic() - started) * 1000)
     return last
+
+
+def summarize_headers(cfg: Settings, thread_id: str = "") -> List[Tuple[str, str]]:
+    """Auth headers for POST …/trace/summarize."""
+    # The summarize endpoint takes the credential as `Authorization: Bearer`, whichever
+    # header the evaluation call uses (the Kong plugin does the same).
+    headers = [
+        ("Content-Type", "application/json"),
+        ("Authorization", f"Bearer {cfg.token}"),
+        ("User-Agent", USER_AGENT),
+    ]
+    if cfg.policy_store_id:
+        headers.append(("policyStoreId", cfg.policy_store_id))
+    if thread_id:
+        headers.append(("X-Reva-Thread-Id", thread_id))
+    if cfg.origin_app:
+        headers.append(("X-API-Origin-App", cfg.origin_app))
+    return headers
+
+
+def summarize(cfg: Settings, trace_id: str, thread_id: str = "", output: str = "",
+              timeout: Optional[float] = None) -> int:
+    """Best-effort finalize of a finished prompt. Never raises; returns HTTP status or 0.
+
+    RTG already has the hops from evaluation; `output` is the agent's final answer
+    so later turns can populate `session.messages`.
+    """
+    trace_id = (trace_id or "").strip()
+    if not trace_id or not cfg.token:
+        return 0
+    body: Dict[str, Any] = {"trace_id": trace_id}
+    if thread_id.strip():
+        body["thread_id"] = thread_id.strip()
+    if output:
+        body["output"] = output[:SUMMARIZE_OUTPUT_MAX]
+    data = json.dumps(body).encode("utf-8")
+    try:
+        status, _text = _post(
+            cfg.summarize_url, data, summarize_headers(cfg, thread_id.strip()),
+            timeout if timeout is not None else min(cfg.timeout_seconds, 5.0))
+        return status
+    except Exception:  # noqa: BLE001 - summarize must never fail the caller
+        return 0
